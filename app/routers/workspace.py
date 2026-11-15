@@ -65,6 +65,7 @@ from app.services.visit_language import (
     DetectedLanguage,
     LanguageUnavailableError,
     localize_draft,
+    normalize_objective_placeholder,
     tag_recording,
 )
 
@@ -108,9 +109,7 @@ def require_local_workspace(request: Request, settings: SettingsDep) -> None:
         if request.headers.get("x-escriba-workspace") != "1" or (
             origin is not None and origin != str(request.base_url).rstrip("/")
         ):
-            raise HTTPException(
-                status_code=403, detail="Open the Escriba workspace to continue."
-            )
+            raise HTTPException(status_code=403, detail="Open the Escriba workspace to continue.")
 
 
 router = APIRouter(
@@ -486,7 +485,7 @@ async def create_draft(
             ) from exc
 
     # Remove a duplicated decision, preserving findings and statements about completed tests.
-    note = synthesis.soap_note
+    note = normalize_objective_placeholder(synthesis.soap_note, _note_language(visit))
     if TESTING_DEFERRAL.search(note.plan) or TESTING_PLAN.search(note.plan):
         objective = OBJECTIVE_TESTING_ABSENCE.sub(
             "", TESTING_DEFERRAL.sub("", note.objective)

@@ -16,7 +16,7 @@ from app.services.draft_verification import (
     verify_draft,
 )
 from app.services.guardrail import PatientContext
-from app.services.visit_language import classify_visit
+from app.services.visit_language import classify_visit, localize_draft
 from tests.fakes import FakeOpenAI
 from tests.test_draft_verification import DRAFT, TRANSCRIPT, pass_result
 
@@ -34,6 +34,34 @@ from tests.test_draft_verification import DRAFT, TRANSCRIPT, pass_result
 )
 def test_language_thresholds(english, spanish, language, confidence):
     assert classify_visit(english, spanish) == (language, confidence)
+
+
+async def test_english_localization_removes_spanish_objective_boilerplate():
+    summary = "La clínica le llamará mañana."
+    draft = DRAFT.model_copy(update={"staged_orders": [], "visit_summary_for_patient": summary})
+    fake = FakeOpenAI()
+    fake.completions.responses.append(
+        {
+            "soap_note": {
+                **draft.soap_note.model_dump(),
+                "objective": (
+                    "Right knee flexion is 110 degrees. "
+                    "No se documentan otros hallazgos objetivos."
+                ),
+            },
+            "order_wording": None,
+            "patient_instructions": None,
+        }
+    )
+    localized = await localize_draft(
+        cast(AsyncOpenAI, fake),
+        Settings(_env_file=None, twilio_validate_signature=False),
+        draft,
+        note_language="en",
+        patient_language=None,
+    )
+    assert localized.soap_note.objective == "Right knee flexion is 110 degrees."
+    assert localized.visit_summary_for_patient == summary
 
 
 async def test_allergy_blocking_and_cross_language_evidence():
