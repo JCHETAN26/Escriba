@@ -1,0 +1,25 @@
+[project]
+name = "escriba"
+version = "1.0.0"
+description = "Escriba: an agentic clinical medical scribe. Autonomous Planning, Human Approval."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "ASYNC", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["twilio.*"]
+ignore_missing_imports = true

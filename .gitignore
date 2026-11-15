@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.gstack/
+
+# Local design explorations and generated benchmark results.
+/*.docx
+/frontend/
+/design/
+/design 2/
+/demo/demo-report.md
+/demo/live-report*.md
+/demo/benchmark/escriba-audio-results.json
+/demo/benchmark/report.md
+/demo/benchmark/synthetic-visits.zip

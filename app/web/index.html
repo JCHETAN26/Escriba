@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Escriba · Clinical Documentation Workspace</title>
+  <link rel="stylesheet" href="/workspace/workspace.css">
+  <script defer src="/workspace/workspace.js"></script>
+</head>
+<body data-screen="capture">
+  <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="icon-mic" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="14" rx="3"/><path d="M5 10v3a7 7 0 0 0 14 0v-3M12 20v2"/></symbol>
+    <symbol id="icon-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+    <symbol id="icon-upload" viewBox="0 0 24 24"><path d="M12 16V4m-5 5 5-5 5 5M4 20h16"/></symbol>
+    <symbol id="icon-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24"><path d="m4 12 5 5L20 6"/></symbol>
+    <symbol id="icon-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></symbol>
+  </svg>
+  <aside id="visit-sidebar" class="sidebar" aria-label="Visits">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>Escriba</div>
+    <button id="open-new-visit" class="primary new-visit" type="button">＋ New visit</button>
+    <h2 class="eyebrow">Recent visits</h2>
+    <nav id="visit-list" aria-label="Saved visits"></nav>
+    <p class="retention">Escriba keeps the transcript and draft. Audio is discarded after processing.</p>
+  </aside>
+  <main class="workspace">
+    <header class="topbar">
+      <div class="breadcrumb">
+        <span class="brand-mark small-mark" aria-hidden="true"></span>
+        <button id="back-visits" class="plain" type="button">Visits</button>
+        <span aria-hidden="true" class="slash">/</span>
+        <h1 id="visit-title" tabindex="-1">New visit</h1>
+        <span id="visit-status" class="badge" hidden></span>
+      </div>
+      <ol id="steps" class="steps" aria-label="Visit progress">
+        <li aria-current="step"><span aria-hidden="true">1</span> Capture</li>
+        <li><span aria-hidden="true">2</span> Review</li>
+        <li><span aria-hidden="true">3</span> Approve</li>
+      </ol>
+      <button id="view-review" type="button" hidden>View review</button>
+      <button id="back-approved" type="button" hidden>Copy note &amp; text patient</button>
+    </header>
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+
+    <section id="capture" class="capture" aria-label="Capture visit">
+      <label for="visit-label" class="eyebrow">Visit label</label>
+      <input id="visit-label" class="visit-label" maxlength="120" placeholder="e.g. Follow-up · Persistent cough">
+      <details class="chart-inputs">
+        <summary>Medication safety context</summary>
+        <label class="field-label" for="chart-allergies">Documented allergies</label>
+        <textarea id="chart-allergies" rows="2" maxlength="5000" placeholder="One allergen per line"></textarea>
+        <label class="field-label" for="chart-medications">Current medications</label>
+        <textarea id="chart-medications" rows="2" maxlength="5000" placeholder="One medication per line, with dose and frequency if known"></textarea>
+      </details>
+      <div id="recorder-card" class="glass recorder" data-stage="idle">
+        <div id="recording-clock" class="recording-clock"><span class="visually-hidden">Elapsed time</span><strong id="elapsed">00:00</strong></div>
+        <div id="waveform" class="waveform" aria-hidden="true"></div>
+        <button id="record" class="mic primary" type="button" aria-label="Start recording"><svg class="icon"><use href="#icon-mic"/></svg></button>
+        <button id="stop" class="mic primary" type="button" aria-label="Stop recording" hidden><svg class="icon"><use href="#icon-stop"/></svg></button>
+        <p id="record-hint" class="muted">Select the microphone to start recording</p>
+        <div id="recording-actions" class="actions" hidden>
+          <button id="discard" type="button">Discard audio</button>
+          <button id="transcribe" class="primary" type="button">Transcribe and draft</button>
+        </div>
+        <ol id="processing" class="processing" aria-label="Processing progress" hidden>
+          <li>Transcribe recording</li><li>Save transcript</li><li>Draft note, instructions and orders</li>
+        </ol>
+        <div id="resume" class="actions" hidden>
+          <button id="generate" class="primary" type="button">Generate draft</button>
+        </div>
+      </div>
+      <div id="upload-area">
+        <div class="divider" aria-hidden="true">OR</div>
+        <div id="drop-zone" class="drop-zone">
+          <span class="upload-icon" aria-hidden="true"><svg class="icon"><use href="#icon-upload"/></svg></span>
+          <div><strong>Upload an audio file</strong><p id="audio-name" class="muted">MP3, M4A, WAV or WebM · up to 25 MB</p></div>
+          <input id="file" class="visually-hidden" type="file" accept=".flac,.mp3,.mp4,.mpeg,.mpga,.m4a,.ogg,.wav,.webm">
+          <label class="file-label" for="file">Choose file</label>
+        </div>
+      </div>
+    </section>
+
+    <section id="review" class="review" aria-label="Review visit" hidden>
+      <section class="glass verification-strip" aria-labelledby="verification-status">
+        <div><h2 id="verification-status" role="status"></h2><p id="verification-metrics" class="muted"></p></div>
+        <div id="verification-counts" class="verification-counts"></div>
+        <button id="run-verification" type="button" hidden>Re-run</button>
+      </section>
+      <section class="glass transcript-card" aria-labelledby="transcript-title">
+        <header class="card-header"><h2 id="transcript-title">Transcript</h2><button id="copy-transcript" class="plain" type="button">Copy transcript</button></header>
+        <div class="transcript-language">
+          <span id="detected-language" class="badge"></span>
+          <button id="change-language" class="plain" type="button" aria-expanded="false" aria-controls="language-controls">Change</button>
+          <div id="language-controls" hidden>
+            <label for="review-note-language">SOAP note and orders</label>
+            <select id="review-note-language"><option value="en">English</option><option value="es">Español</option></select>
+            <label for="review-patient-language">Patient instructions</label>
+            <select id="review-patient-language"><option value="en">English</option><option value="es">Español</option></select>
+            <button id="apply-language" type="button">Translate and verify</button>
+          </div>
+        </div>
+        <p class="transcript-info"><span aria-hidden="true">ⓘ</span> Speaker labels aren’t verified, so none are shown.</p>
+        <p id="transcript-timing" class="transcript-info" hidden>Recording timestamps are unavailable for this visit.</p>
+        <div id="transcript" class="transcript" tabindex="0" aria-label="Transcript text"></div>
+      </section>
+      <div class="note-stack">
+        <section class="glass" aria-labelledby="soap-title">
+          <header class="card-header"><h2 id="soap-title">SOAP note</h2><span id="edit-hint" class="muted">Select any section to edit</span></header>
+          <div id="soap-fields" class="card-content"></div>
+        </section>
+        <section class="glass" aria-labelledby="instructions-title">
+          <header class="card-header"><h2 id="instructions-title"><label for="summary">Patient instructions</label></h2><span id="review-language" class="muted"></span></header>
+          <div class="card-content"><textarea id="summary" rows="6" maxlength="20000" required></textarea></div>
+        </section>
+      </div>
+      <div class="order-stack">
+        <section class="glass" aria-labelledby="orders-title">
+          <header class="card-header"><h2 id="orders-title">Proposed orders</h2><span id="order-count" class="order-count"></span></header>
+          <div id="orders" class="orders"></div>
+        </section>
+        <section class="glass" aria-labelledby="verification-title">
+          <header class="card-header"><h2 id="verification-title">Verification</h2></header>
+          <div class="card-content">
+            <div id="verification-findings"></div>
+            <details id="verification-steps">
+              <summary id="verification-steps-label">How the verifier checked</summary>
+              <ol id="verification-trace" class="verification-trace" aria-label="Verification steps"></ol>
+            </details>
+          </div>
+        </section>
+        <form id="approval" class="glass card-content">
+          <h2>Approve visit</h2>
+          <label class="field-label" for="clinician">Reviewer name</label>
+          <input id="clinician" maxlength="64" required autocomplete="name" placeholder="e.g. Dr. A. Rivera">
+          <label class="text-on-approval"><input id="text-on-approval" type="checkbox"> Text patient instructions on approval</label>
+          <div id="approval-recipient" hidden>
+            <label class="field-label" for="approval-phone">Patient phone number</label>
+            <input id="approval-phone" type="tel" maxlength="32" placeholder="+1 (555) 010-0000" autocomplete="tel" disabled>
+            <p class="muted">Include the country code.</p>
+          </div>
+          <p id="approval-error" class="error" role="alert"></p>
+          <button id="approve" class="primary approve" type="submit" disabled><svg class="icon"><use href="#icon-lock"/></svg>Approve &amp; lock</button>
+          <p id="approval-hint" class="muted"></p>
+          <button id="save" class="save" type="button">Save draft</button>
+        </form>
+        <div id="review-locked" class="glass card-content" hidden>
+          <h2>Approved visit</h2><p class="muted">Editing is locked.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="approved" class="approved" aria-label="Approved visit" hidden>
+      <div class="note-stack">
+        <section class="glass approval-banner">
+          <span class="approval-icon" aria-hidden="true"><svg class="icon"><use href="#icon-check"/></svg></span>
+          <div><h2 id="approved-by"></h2><p id="approved-at" class="muted"></p></div>
+          <button id="copy-note" class="primary" type="button"><svg class="icon"><use href="#icon-copy"/></svg><span>Copy full note</span></button>
+        </section>
+        <section class="glass"><header class="card-header"><h2>SOAP note</h2><span class="muted">Paste into your EHR</span></header><div id="approved-soap" class="card-content"></div></section>
+        <section class="glass card-content">
+          <div class="kept-heading"><h2>Orders to place in the EHR</h2><span id="kept-count" class="muted"></span></div>
+          <div id="kept-orders" class="kept-orders"></div>
+        </section>
+      </div>
+      <section class="glass patient-card" aria-labelledby="sms-title">
+        <header class="card-header"><h2 id="sms-title">Patient summary preview</h2><button id="copy-summary" class="plain" type="button">Copy instructions</button></header>
+        <div class="phone">
+          <div class="phone-header"><span class="brand-mark" aria-hidden="true"></span><span id="care-team">Your care team</span></div>
+          <div id="sms-preview" class="messages" aria-label="Approved patient instructions" tabindex="0"></div>
+        </div>
+        <form id="sms-form" class="card-content">
+          <label class="field-label" for="sms-phone">Patient phone number</label>
+          <div class="sms-controls">
+            <input id="sms-phone" type="tel" autocomplete="tel" required placeholder="+1 (555) 010-0000" maxlength="32" aria-describedby="sms-phone-help">
+            <button id="send-sms" class="primary" type="submit" disabled>Send text</button>
+          </div>
+          <p id="sms-phone-help" class="muted">Include the country code. Sends the approved instructions.</p>
+          <p id="sms-result" class="sms-result" role="status"></p>
+          <p id="sms-error" class="error" role="alert"></p>
+        </form>
+      </section>
+    </section>
+  </main>
+</body>
+</html>

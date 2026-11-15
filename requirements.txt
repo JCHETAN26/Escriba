@@ -1,0 +1,17 @@
+# --- Web framework ---
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9          # application/x-www-form-urlencoded parsing (Twilio webhooks)
+
+# --- Data validation / configuration ---
+pydantic>=2.7,<3.0
+pydantic-settings>=2.3,<3.0
+
+# --- Persistence ---
+sqlalchemy[asyncio]>=2.0.30,<2.1
+aiosqlite>=0.20,<1.0             # local development driver
+asyncpg>=0.29,<1.0               # production PostgreSQL driver
+
+# --- Integrations ---
+twilio>=9.0,<10.0                # request signature validation + TwiML generation
+openai>=2.54,<3.0                # async client, timed transcriptions, and Structured Outputs
