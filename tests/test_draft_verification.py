@@ -202,3 +202,48 @@ async def test_wrong_language_is_distinct_from_unsupported_meaning() -> None:
     assert finding.status == "flagged"
     assert finding.evidence == [quote]
     assert "English" in (finding.question or "")
+
+
+@pytest.mark.parametrize(
+    ("source", "assessment", "flagged"),
+    [
+        ("", "Persistent right knee pain with limited right knee flexion.", True),
+        ("", "Right knee flexion was limited to 110°.", True),
+        ("", "Limited activity due to pain, with right knee flexion at 110°.", False),
+        (" Right knee flexion is limited.", "Limited right knee flexion.", False),
+    ],
+)
+async def test_numeric_flexion_alone_does_not_support_a_limitation(
+    source: str, assessment: str, flagged: bool
+) -> None:
+    quote = "La rodilla derecha se flexiona a ciento diez grados."
+    fake = FakeOpenAI()
+    draft = DRAFT.model_copy(
+        update={
+            "staged_orders": [],
+            "soap_note": DRAFT.soap_note.model_copy(
+                update={"objective": "Right knee flexion was 110°.", "assessment": assessment}
+            ),
+        }
+    )
+    result = pass_result(repaired=True)
+    result["items"].pop()
+    result["items"][1]["evidence"] = [quote]
+    result["items"][2]["evidence"] = [source.strip() if source else quote]
+    fake.completions.responses.append(result)
+    _, report = await verify_draft(
+        cast(AsyncOpenAI, fake),
+        Settings(_env_file=None, twilio_validate_signature=False),
+        draft,
+        TRANSCRIPT.replace("Right knee bends to 110 degrees.", quote) + source,
+        PatientContext(patient_id=uuid.uuid4()),
+        repair=False,
+    )
+    objective = next(item for item in report.findings if item.area == "objective")
+    assessments = [item for item in report.findings if item.area == "assessment"]
+    assert objective.text == "Right knee flexion was 110°."
+    assert objective.status == "supported"
+    assert any(item.status == "flagged" for item in assessments) == flagged
+    if flagged:
+        assert quote in assessments[0].evidence
+        assert "inferred limitation" in (assessments[0].question or "")

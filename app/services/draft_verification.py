@@ -214,6 +214,11 @@ gender: if Spanish uses neutral "le" or the patient's gender is not stated, keep
 wording such as "La clínica le llamará"; flag an unsupported "la llamará" or "lo llamará".
 Do not accept severity ratings or approximation words added to exact measurements, or a claim
 that pain was observed on exam when the transcript only reports it.
+A range-of-motion measurement does not establish normality or a limitation. In any section,
+flag "limited right knee flexion" when the source only says "La rodilla derecha se flexiona a
+ciento diez grados." Keep the measured 110° in Objective and omit the inferred limitation.
+Accept limitations only when the transcript explicitly describes them. Do not add measurements
+to Assessment if they are already recorded in Objective.
 Deciding not to order tests today belongs in the Plan; it does not establish what tests were
 obtained or performed and should not be stated as an Objective result.
 Flag a Plan or patient instruction that loses a stated qualifier,
@@ -246,6 +251,39 @@ like "we are starting amlodipine." Exclude historical use, allergy mentions, and
 instructions NOT to take the drug. Use the full ordered text context to resolve references.
 Return an empty list for other items and when there is no active direction.
 """
+
+
+_KNEE_FLEXION = re.compile(
+    r"\b(?:knee (?:flexion|(?:can )?(?:flex(?:es)?|bends?))"
+    r"|flexión (?:de (?:la )?)?rodilla(?: derecha| izquierda)?"
+    r"|rodilla(?: derecha| izquierda)? (?:se flexiona|se dobla|flexiona))\b",
+    re.IGNORECASE,
+)
+_FLEXION_QUALIFIER = (
+    r"(?:limited|reduced|restricted|limitación|limitad[ao]|reducid[ao]|restringid[ao])"
+)
+_KNEE_FLEXION_DESCRIPTION = re.compile(
+    rf"\b(?:{_FLEXION_QUALIFIER} (?:of (?:the )?|de (?:la )?|en (?:la )?)?"
+    rf"(?:right |left )?(?:knee flexion|flexión (?:de (?:la )?)?rodilla)"
+    rf"|(?:knee flexion|flexión (?:de (?:la )?)?rodilla(?: derecha| izquierda)?) "
+    rf"(?:(?:was|is|está|fue) )?{_FLEXION_QUALIFIER})\b",
+    re.IGNORECASE,
+)
+_ANGLE = re.compile(r"\d+\s*°|\b(?:degrees?|grados?)\b", re.IGNORECASE)
+_EXPLICIT_MOTION_CONTEXT = re.compile(
+    rf"\b(?:{_FLEXION_QUALIFIER}|limitation|only|solo|sólo|solamente|no puede|"
+    r"cannot|can['\u2019]t|unable)\b",
+    re.IGNORECASE,
+)
+
+
+def _neutral_knee_flexion_evidence(transcript: str) -> list[str]:
+    """Find numeric flexion evidence without an explicit limitation in the source."""
+    statements = [part.strip() for part in SENTENCE.split(transcript) if part.strip()]
+    relevant = [part for part in statements if _KNEE_FLEXION.search(part)]
+    if any(_EXPLICIT_MOTION_CONTEXT.search(part) for part in relevant):
+        return []  # Leave explicitly qualified measurements to the semantic check.
+    return [part for part in relevant if _ANGLE.search(part)][:1]
 
 
 async def _ground(
@@ -322,6 +360,7 @@ async def _ground(
     findings = []
     replacements = {}
     directions: list[PrescriptionDirection] = []
+    neutral_flexion = _neutral_knee_flexion_evidence(transcript)
     for item in checked:
         verdict = verdicts[item.id]
         if item.area in ("plan", "patient_instructions"):
@@ -350,6 +389,17 @@ async def _ground(
         if verdict.wrong_language:
             language = _required_language(item.area, summary_language, note_language)
             question = f"Language mismatch: rewrite this wording entirely in {language}."
+        elif (
+            neutral_flexion
+            and item.area in ("objective", "assessment")
+            and _KNEE_FLEXION_DESCRIPTION.search(item.text)
+        ):
+            supported = False
+            evidence = list(dict.fromkeys([*neutral_flexion, *evidence]))
+            question = (
+                "The transcript gives a knee flexion measurement. "
+                "Can you remove the inferred limitation or cite where it was stated?"
+            )
         if order and order.order_type == "prescription" and verdict.medication_details_missing:
             missing = [
                 field

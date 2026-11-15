@@ -163,6 +163,10 @@ def build_clinical_synthesis_messages(
         "stairs'; 'denies falling' does not imply denial of trauma or injury. Preserve the "
         "exact scope of comparisons, modifiers and negation in either output language. "
         "If a measurement is stated exactly, do not add 'approximately' or rate its severity. "
+        "Do not infer whether measured motion is normal or limited, even in Assessment. "
+        "If the transcript only says the right knee flexes to 110 degrees, write "
+        "'Right knee flexion was 110°' in Objective. Do not call it limited or reduced "
+        "in any section unless the transcript explicitly describes a limitation. "
         "If pain is reported while taking stairs, do not say it was observed on exam unless "
         "an observed exam finding is explicitly stated."
     )
