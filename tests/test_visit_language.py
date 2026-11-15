@@ -16,7 +16,8 @@ from app.services.draft_verification import (
     verify_draft,
 )
 from app.services.guardrail import PatientContext
-from app.services.visit_language import classify_visit, localize_draft
+from app.services.recording import RecordingTranscript, TranscriptSegment
+from app.services.visit_language import classify_visit, localize_draft, tag_recording
 from tests.fakes import FakeOpenAI
 from tests.test_draft_verification import DRAFT, TRANSCRIPT, pass_result
 
@@ -36,6 +37,32 @@ def test_language_thresholds(english, spanish, language, confidence):
     assert classify_visit(english, spanish) == (language, confidence)
 
 
+async def test_language_detection_matches_segments_by_id_without_model_word_counts():
+    fake = FakeOpenAI()
+    fake.completions.responses.append(
+        {
+            "segments": [
+                {"id": 1, "language": "es", "english_percent": None},
+                {"id": 0, "language": "en", "english_percent": None},
+            ],
+        }
+    )
+    recording = RecordingTranscript(
+        text="How's your knee? Me duele al subir.",
+        segments=[
+            TranscriptSegment(start=0, text="How's your knee?"),
+            TranscriptSegment(start=1.5, text="Me duele al subir."),
+        ],
+    )
+    detected = await tag_recording(
+        cast(AsyncOpenAI, fake),
+        Settings(_env_file=None, twilio_validate_signature=False),
+        recording,
+    )
+    assert detected == ("mixed", 0.5)
+    assert [segment.language for segment in recording.segments] == ["en", "es"]
+
+
 async def test_english_localization_removes_spanish_objective_boilerplate():
     summary = "La clínica le llamará mañana."
     draft = DRAFT.model_copy(update={"staged_orders": [], "visit_summary_for_patient": summary})
@@ -45,8 +72,7 @@ async def test_english_localization_removes_spanish_objective_boilerplate():
             "soap_note": {
                 **draft.soap_note.model_dump(),
                 "objective": (
-                    "Right knee flexion is 110 degrees. "
-                    "No se documentan otros hallazgos objetivos."
+                    "Right knee flexion is 110 degrees. No se documentan otros hallazgos objetivos."
                 ),
             },
             "order_wording": None,
