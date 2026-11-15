@@ -177,9 +177,17 @@ def test_recording_to_approved_note(
         {
             "soap_note": {
                 "subjective": "Right ankle pain",
-                "objective": "Mild swelling. No tests today.",
+                "objective": (
+                    "Mild swelling. No tests were ordered today as stated by the clinician."
+                    if language == "en"
+                    else "Mild swelling. No tests today."
+                ),
                 "assessment": "Possible sprain",
-                "plan": "Rest and elevate. No tests are planned today.",
+                "plan": (
+                    "Rest and elevate. The clinician stated that no tests are planned today."
+                    if language == "en"
+                    else "Rest and elevate. No tests are planned today."
+                ),
             },
             "visit_summary_for_patient": (
                 "Descanse y eleve el tobillo. No hay pruebas previstas para hoy."
@@ -319,7 +327,7 @@ def test_recording_to_approved_note(
         draft = generated.json()["draft"]
         assert draft["status"] == "review_pending"
         assert draft["soap_note"]["objective"] == "Mild swelling."
-        assert "No tests are planned today." in draft["soap_note"]["plan"]
+        assert "no tests are planned today." in draft["soap_note"]["plan"].lower()
         assert draft["visit_summary_for_patient"] == fixture.visit_summary_for_patient
         if language == "es":
             assert (

@@ -74,22 +74,24 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 LOCKED_VISIT = "This visit is approved and locked."
 STALE_DRAFT = "This draft changed. Reopen the visit."
 PhoneNumber = Annotated[str, Field(pattern=r"^\+[1-9][0-9]{7,14}$")]
-TESTING_DEFERRAL = re.compile(
-    r"(?:^|(?<=[.!?\n]))[ \t]*"
+TESTING_DEFERRAL_WORDING = (
     r"(?:no tests? (?:are planned |are being ordered |will be ordered )?today"
-    r"|testing (?:is |will be )?deferred today)[.!?]?"
+    r"|testing (?:is |will be )?deferred today)"
+)
+TESTING_DEFERRAL = re.compile(
+    rf"(?:^|(?<=[.!?\n]))[ \t]*{TESTING_DEFERRAL_WORDING}[.!?]?"
     r"(?=[ \t]*(?:$|\n)|(?<=[.!?])\s)",
     re.IGNORECASE,
 )
 TESTING_PLAN = re.compile(
-    r"\b(?:not (?:going to )?order tests? today|no tests? (?:will be|are being) ordered today|"
+    rf"\b(?:{TESTING_DEFERRAL_WORDING}|not (?:going to )?order tests? today|"
     r"no se (?:van a pedir|pedirán|solicitarán) pruebas hoy)\b",
     re.IGNORECASE,
 )
 OBJECTIVE_TESTING_ABSENCE = re.compile(
     r"(?:^|(?<=[.!?\n]))[ \t]*(?:"
     r"no tests? (?:were|was) (?:obtained|performed|ordered) today"
-    r"(?: per (?:the )?clinician(?:'s)? statement)?"
+    r"(?: per (?:the )?clinician(?:'s)? statement| as stated by the clinician)?"
     r"|no se (?:realizaron|solicitaron|hicieron) pruebas hoy"
     r")[.!?]?(?=[ \t]*(?:$|\n)|(?<=[.!?])\s)",
     re.IGNORECASE,
@@ -486,7 +488,7 @@ async def create_draft(
 
     # Remove a duplicated decision, preserving findings and statements about completed tests.
     note = normalize_objective_placeholder(synthesis.soap_note, _note_language(visit))
-    if TESTING_DEFERRAL.search(note.plan) or TESTING_PLAN.search(note.plan):
+    if TESTING_PLAN.search(note.plan):
         objective = OBJECTIVE_TESTING_ABSENCE.sub(
             "", TESTING_DEFERRAL.sub("", note.objective)
         ).strip()
