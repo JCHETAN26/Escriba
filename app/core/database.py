@@ -11,8 +11,8 @@ from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
 from fastapi import Depends
-from sqlalchemy import MetaData, event, text
-from sqlalchemy.engine import make_url
+from sqlalchemy import MetaData, event, inspect, text
+from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -83,6 +83,22 @@ async def create_schema(engine: AsyncEngine, *, hosted_demo: bool = False) -> No
             # Serialize table initialization when Vercel starts concurrent instances.
             await conn.execute(text("SELECT pg_advisory_xact_lock(561023849)"))
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_upgrade_visit_titles)
+
+
+def _upgrade_visit_titles(conn: Connection) -> None:
+    table = "workspace_visit_details"
+    columns = {column["name"]: column["type"] for column in inspect(conn).get_columns(table)}
+    if conn.dialect.name == "postgresql" and getattr(columns["label"], "length", None) == 120:
+        conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN label TYPE VARCHAR(160)"))
+    if "label_edited" not in columns:
+        conn.execute(
+            text(f"ALTER TABLE {table} ADD COLUMN label_edited BOOLEAN NOT NULL DEFAULT FALSE")
+        )
+        # Existing labels were manually entered at capture.
+        conn.execute(text(f"UPDATE {table} SET label_edited = TRUE"))
+    if "visit_title" not in columns:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN visit_title VARCHAR(120)"))
 
 
 async def get_db_session(connection: HTTPConnection) -> AsyncIterator[AsyncSession]:

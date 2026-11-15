@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
@@ -149,14 +150,28 @@ router = APIRouter(
 )
 
 
-class VisitLabel(BaseModel):
+class NewVisit(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
-    label: str = Field(min_length=1, max_length=120)
     preferred_language: SummaryLanguage | None = None
     allergies: list[Allergy] = Field(default_factory=list, max_length=30)
     current_medications: list[Medication] = Field(default_factory=list, max_length=50)
     patient_id: uuid.UUID | None = None
     patient_name: str | None = Field(default=None, min_length=1, max_length=120)
+    time_zone: str = Field(default="UTC", min_length=1, max_length=100)
+
+    @field_validator("time_zone")
+    @classmethod
+    def valid_time_zone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("Use an IANA time zone such as America/Phoenix.") from exc
+        return value
+
+
+class RenameVisit(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    label: str = Field(min_length=1, max_length=120)
 
 
 class PatientChartOption(BaseModel):
@@ -169,13 +184,14 @@ class PatientChartOption(BaseModel):
 class VisitListItem(BaseModel):
     id: uuid.UUID
     label: str
+    label_edited: bool
+    patient_name: str | None
     created_at: datetime
     status: EncounterStatus
 
 
 class VisitView(VisitListItem):
     patient_id: uuid.UUID
-    patient_name: str
     transcript: str | None
     transcript_segments: list[TranscriptSegment] = Field(default_factory=list)
     draft: SynthesizeResponse | None
@@ -294,18 +310,27 @@ async def _load_visit(session: DbSession, visit_id: uuid.UUID, *, lock: bool = F
 
 
 def _item(visit: Encounter) -> VisitListItem:
+    details = visit.workspace_details
     return VisitListItem(
         id=visit.id,
-        label=visit.workspace_details.label
-        if visit.workspace_details
-        else _patient_label(visit.patient),
+        label=details.label
+        if details
+        else _patient_name(visit.patient) or _automatic_label(None, visit.created_at),
+        label_edited=details.label_edited if details else bool(_patient_name(visit.patient)),
+        patient_name=_patient_name(visit.patient),
         created_at=visit.created_at,
         status=visit.status,
     )
 
 
-def _patient_label(patient: Patient) -> str:
-    return str(patient.demographics.get("label") or "Unnamed patient")
+def _patient_name(patient: Patient) -> str | None:
+    name = patient.demographics.get("label")
+    return name if isinstance(name, str) and name else None
+
+
+def _automatic_label(patient_name: str | None, date: datetime) -> str:
+    hour = date.hour % 12 or 12
+    return f"{patient_name or 'Visit'} · {date.day} {date:%b}, {hour}:{date.minute:02d}"
 
 
 async def _view(visit: Encounter, session: DbSession) -> VisitView:
@@ -314,7 +339,7 @@ async def _view(visit: Encounter, session: DbSession) -> VisitView:
     draft = None
     verification = None
     if doc is not None:
-        draft = SynthesizeResponse.from_document_and_synthesis(doc, _synthesis(doc))
+        draft = SynthesizeResponse.from_document_and_synthesis(doc, _synthesis(doc, visit))
         verification = await _verification(doc, session)
     chart = PatientContext.from_patient(visit.patient)
     previous = await session.scalar(
@@ -333,7 +358,6 @@ async def _view(visit: Encounter, session: DbSession) -> VisitView:
     return VisitView(
         **_item(visit).model_dump(),
         patient_id=visit.patient_id,
-        patient_name=_patient_label(visit.patient),
         transcript=visit.transcript,
         transcript_segments=[
             TranscriptSegment.model_validate(segment) for segment in timeline.segments
@@ -355,8 +379,9 @@ async def _view(visit: Encounter, session: DbSession) -> VisitView:
     )
 
 
-def _synthesis(doc: ClinicalDocument) -> EncounterSynthesisResult:
+def _synthesis(doc: ClinicalDocument, visit: Encounter) -> EncounterSynthesisResult:
     return EncounterSynthesisResult(
+        visit_title=visit.workspace_details.visit_title if visit.workspace_details else None,
         soap_note=SOAPNote.model_validate(doc.generated_soap),
         staged_orders=[StagedOrder.model_validate(order) for order in doc.staged_orders],
         visit_summary_for_patient=doc.visit_summary_for_patient or "",
@@ -403,9 +428,29 @@ def _note_language(visit: Encounter) -> SummaryLanguage:
 
 def _save_visit_language(visit: Encounter, **values: object) -> None:
     updated = {**_visit_language(visit), **values}
+    _visit_details(visit).language = updated
+
+
+def _visit_details(visit: Encounter) -> WorkspaceVisitDetails:
     if visit.workspace_details is None:
-        visit.workspace_details = WorkspaceVisitDetails(label=_patient_label(visit.patient))
-    visit.workspace_details.language = updated
+        item = _item(visit)
+        visit.workspace_details = WorkspaceVisitDetails(
+            label=item.label,
+            label_edited=item.label_edited,
+            language=dict(visit.patient.demographics),
+        )
+    return visit.workspace_details
+
+
+async def _save_visit_title(session: DbSession, visit: Encounter, title: str) -> None:
+    # Reload after taking the encounter lock so drafting cannot undo a concurrent rename.
+    details = await session.get(WorkspaceVisitDetails, visit.id, populate_existing=True)
+    if details is not None:
+        visit.workspace_details = details
+    details = _visit_details(visit)
+    details.visit_title = title
+    if not details.label_edited:
+        details.label = title
 
 
 def _client(request: Request) -> AsyncOpenAI:
@@ -462,7 +507,7 @@ async def list_patient_charts(session: DbSession, response: Response) -> list[Pa
     return [
         PatientChartOption(
             id=patient.id,
-            label=_patient_label(patient),
+            label=_patient_name(patient) or "Unnamed patient",
             last_visit_at=last_visit,
             allergies=PatientContext.from_patient(patient).allergies,
         )
@@ -471,12 +516,12 @@ async def list_patient_charts(session: DbSession, response: Response) -> list[Pa
 
 
 @router.post("/api/visits", response_model=VisitView, status_code=201)
-async def create_visit(body: VisitLabel, session: DbSession, response: Response) -> VisitView:
+async def create_visit(body: NewVisit, session: DbSession, response: Response) -> VisitView:
     _no_store(response)
     if body.patient_id is None:
         patient = Patient(
             demographics={
-                "label": body.patient_name or body.label,
+                "label": body.patient_name,
                 "preferred_language": body.preferred_language,
             },
             allergies=[allergy.model_dump() for allergy in body.allergies],
@@ -496,22 +541,39 @@ async def create_visit(body: VisitLabel, session: DbSession, response: Response)
         if existing is None:
             raise HTTPException(status_code=404, detail="Patient chart not found.")
         patient = existing
+    created_at = utcnow()
     visit = Encounter(
         patient=patient,
         workspace_details=WorkspaceVisitDetails(
-            label=body.label,
+            label=_automatic_label(
+                _patient_name(patient), created_at.astimezone(ZoneInfo(body.time_zone))
+            ),
             language={
                 "preferred_language": body.preferred_language
                 or patient.demographics.get("preferred_language"),
             },
         ),
         provider_id=_workspace_provider(session),
-        scheduled_time=utcnow(),
+        created_at=created_at,
+        scheduled_time=created_at,
         clinical_documents=[],
     )
     session.add(visit)
     await session.commit()
     return await _view(visit, session)
+
+
+@router.patch("/api/visits/{visit_id}", response_model=VisitListItem)
+async def rename_visit(
+    visit_id: uuid.UUID, body: RenameVisit, session: DbSession, response: Response
+) -> VisitListItem:
+    _no_store(response)
+    visit = await _load_visit(session, visit_id, lock=True)
+    details = _visit_details(visit)
+    details.label = body.label
+    details.label_edited = True
+    await session.commit()
+    return _item(visit)
 
 
 @router.post("/api/visits/{visit_id}/allergies", response_model=VisitView)
@@ -847,6 +909,8 @@ async def create_draft(
         .values(status=EncounterStatus.DOCUMENTATION_PENDING)
     )
     _require_change(result)
+    if synthesis.visit_title:
+        await _save_visit_title(session, visit, synthesis.visit_title)
     doc = ClinicalDocument(encounter=visit)
     populate_draft(doc, synthesis)
     session.add(doc)
@@ -917,7 +981,7 @@ async def _verify_visit(
         raise HTTPException(status_code=409, detail=LOCKED_VISIT)
     if _revision(body.revision) != _revision(doc.updated_at):
         raise HTTPException(status_code=409, detail=STALE_DRAFT)
-    draft = _synthesis(doc)
+    draft = _synthesis(doc, visit)
     prescriptions = {
         index
         for index, order in enumerate(draft.staged_orders)
@@ -999,7 +1063,7 @@ async def change_visit_language(
     _no_store(response)
     visit = await _load_visit(session, visit_id)
     doc = _editable_doc(visit, body.revision)
-    draft = _synthesis(doc)
+    draft = _synthesis(doc, visit)
     note_changed = body.note_language != _note_language(visit)
     patient_changed = body.patient_language != _preferred_language(visit)
     if not (note_changed or patient_changed):
@@ -1026,6 +1090,9 @@ async def change_visit_language(
         raise HTTPException(
             status_code=502, detail="Could not translate and verify the draft."
         ) from exc
+    if note_changed and translated.visit_title and translated.visit_title != draft.visit_title:
+        await session.scalar(select(Encounter.id).where(Encounter.id == visit_id).with_for_update())
+        await _save_visit_title(session, visit, translated.visit_title)
     _save_visit_language(
         visit, note_language=body.note_language, patient_language=body.patient_language
     )
@@ -1053,7 +1120,7 @@ async def undo_correction(
     )
     if report is None or correction is None or correction.area == "order":
         raise HTTPException(status_code=409, detail="This correction is no longer available.")
-    draft = _synthesis(doc)
+    draft = _synthesis(doc, visit)
     area = correction.area
     note = draft.soap_note.model_dump()
     value = draft.visit_summary_for_patient if area == "patient_instructions" else note[area]

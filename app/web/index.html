@@ -16,6 +16,7 @@
     <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2"/></symbol>
     <symbol id="icon-check" viewBox="0 0 24 24"><path d="m4 12 5 5L20 6"/></symbol>
     <symbol id="icon-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></symbol>
+    <symbol id="icon-pencil" viewBox="0 0 24 24"><path d="m14 6 4 4M4 20l4.5-1 11-11a2.8 2.8 0 0 0-4-4l-11 11L4 20Z"/></symbol>
   </svg>
   <aside id="visit-sidebar" class="sidebar" aria-label="Visits">
     <div class="brand"><span class="brand-mark" aria-hidden="true"></span>Escriba</div>
@@ -30,7 +31,16 @@
         <span class="brand-mark small-mark" aria-hidden="true"></span>
         <button id="back-visits" class="plain" type="button">Visits</button>
         <span aria-hidden="true" class="slash">/</span>
-        <h1 id="visit-title" tabindex="-1">New visit</h1>
+        <h1 id="visit-heading" tabindex="-1">
+          <span id="capture-title">New visit</span>
+          <button id="visit-title" class="rename-visit" type="button" aria-label="Rename visit" hidden>
+            <span id="visit-title-text"></span>
+            <svg class="icon" aria-hidden="true"><use href="#icon-pencil"/></svg>
+          </button>
+        </h1>
+        <form id="rename-visit-form" class="rename-visit-form" hidden>
+          <input id="rename-visit-input" aria-label="Rename visit" maxlength="120" required autocomplete="off">
+        </form>
         <span id="visit-status" class="badge" hidden></span>
         <a id="previous-visit" class="previous-visit" hidden>Prior visit on this chart</a>
       </div>
@@ -60,8 +70,6 @@
         <select id="patient-chart" aria-describedby="returning-allergies"></select>
         <p id="returning-allergies" class="muted"></p>
       </div>
-      <label for="visit-label" class="eyebrow">Visit label</label>
-      <input id="visit-label" class="visit-label" maxlength="120" placeholder="e.g. Follow-up · Persistent cough">
       <details id="capture-chart-inputs" class="chart-inputs">
         <summary>Medication safety context</summary>
         <label class="field-label" for="chart-allergies">Documented allergies</label>

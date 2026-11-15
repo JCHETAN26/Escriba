@@ -2,10 +2,12 @@
 
 import sqlite3
 from contextlib import closing
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
@@ -25,6 +27,88 @@ from app.services.recording import RecordingTranscript, TranscriptSegment
 from tests.fakes import FakeOpenAI
 
 WORKSPACE = {"X-Escriba-Workspace": "1"}
+
+
+def test_visit_titles_fall_back_and_preserve_manual_renames(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'titles.db'}",
+        twilio_validate_signature=False,
+    )
+    title = "Seguimiento de rodilla"
+    titles = iter([None, title, title])
+
+    async def transcribe(*_args):
+        return RecordingTranscript("Me duele la rodilla.", [])
+
+    async def tag(*_args):
+        return "es", 1.0
+
+    async def draft(*_args, note_language, **_kwargs):
+        assert note_language == "es"
+        candidate = next(titles)
+        if candidate is None:
+            raise HTTPException(status_code=502, detail="Draft generation failed.")
+        return EncounterSynthesisResult(
+            visit_title=candidate,
+            soap_note=SOAPNote(
+                subjective="Dolor de rodilla.",
+                objective="Sin examen.",
+                assessment="Dolor de rodilla.",
+                plan="Seguimiento.",
+            ),
+            visit_summary_for_patient="Seguimiento.",
+        )
+
+    monkeypatch.setattr(workspace, "utcnow", lambda: datetime(2026, 11, 5, 13, 4, tzinfo=UTC))
+    monkeypatch.setattr(workspace, "transcribe_recording", transcribe)
+    monkeypatch.setattr(workspace, "tag_recording", tag)
+    monkeypatch.setattr(workspace, "generate_draft", draft)
+    app = create_app(settings)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 54321)) as client:
+        app.state.openai_client = FakeOpenAI()
+
+        def call(method, path, **kwargs):
+            response = client.request(method, path, headers=WORKSPACE, **kwargs)
+            assert response.is_success, response.text
+            return response.json()
+
+        def recorded_visit(body):
+            visit = call("POST", "/api/visits", json=body)
+            url = f"/api/visits/{visit['id']}"
+            recording = client.put(
+                url + "/recording", content=b"test", headers={**WORKSPACE, "X-Audio-Format": "wav"}
+            )
+            assert recording.is_success, recording.text
+            return visit, url
+
+        visit, url = recorded_visit({"patient_name": "Morgan", "label": "Ignored old label"})
+        assert visit["label"] == "Morgan · 5 Nov, 1:04"
+        assert visit["label_edited"] is False
+        failed = client.post(url + "/draft", headers=WORKSPACE)
+        assert failed.status_code == 502
+        assert call("GET", url)["label"] == visit["label"]
+        drafted = call("POST", url + "/draft")
+        assert drafted["label"] == drafted["draft"]["visit_title"] == title
+        assert call("GET", url)["draft"]["visit_title"] == title
+
+        unnamed, unnamed_url = recorded_visit({})
+        assert unnamed["patient_name"] is None
+        assert unnamed["label"] == "Visit · 5 Nov, 1:04"
+        renamed = call("PATCH", unnamed_url, json={"label": "  Revisión de Morgan  "})
+        assert renamed["label"] == "Revisión de Morgan"
+        assert renamed["label_edited"] is True
+        drafted = call("POST", unnamed_url + "/draft")
+        assert drafted["label"] == renamed["label"]
+        assert drafted["draft"]["visit_title"] == title
+        recent = {item["id"]: item for item in call("GET", "/api/visits")}
+        assert recent[visit["id"]]["patient_name"] == "Morgan"
+        assert recent[unnamed["id"]]["label"] == renamed["label"]
+        assert client.patch(unnamed_url, headers=WORKSPACE, json={"label": "  "}).status_code == 422
+        local = call("POST", "/api/visits", json={"time_zone": "America/Phoenix"})
+        assert local["label"] == "Visit · 5 Nov, 6:04"
 
 
 def test_hosted_recording_chunks_are_validated_reassembled_and_removed(
@@ -237,7 +321,7 @@ def test_returning_patient_reuses_allergy_and_keeps_visit_details(
                 "revision": documented["draft"]["updated_at"],
             },
         )["draft"]
-        call(
+        approved = call(
             "PUT",
             prior + "/review",
             json={
@@ -265,7 +349,11 @@ def test_returning_patient_reuses_allergy_and_keeps_visit_details(
         assert checked["note_language"] == "es"
         assert chart_contexts[-1].allergies == (Allergy(allergen="amlodipine", reaction="hives"),)
         assert call("GET", prior)["note_language"] == "en"
-        assert call("GET", prior)["label"] == "First visit"
+        assert call("GET", prior)["label"] == first["label"]
+        renamed_prior = call("PATCH", prior, json={"label": "Medication allergy review"})
+        assert renamed_prior["label_edited"] is True
+        assert renamed_prior["label"] == "Medication allergy review"
+        assert call("GET", prior)["draft"] == approved["draft"]
 
         same_name = call(
             "POST", "/api/visits", json={"label": "First visit", "patient_name": "Morgan"}

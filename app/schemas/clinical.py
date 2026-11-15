@@ -186,6 +186,9 @@ class EncounterSynthesisResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
+    visit_title: str | None = Field(
+        default=None, description="A 2 to 5 word title from the stated reason for the visit."
+    )
     soap_note: SOAPNote = Field(
         description="Complete structured clinical SOAP note for provider documentation."
     )
@@ -206,3 +209,12 @@ class EncounterSynthesisResult(BaseModel):
             "or what to record in a diary."
         ),
     )
+
+    @field_validator("visit_title")
+    @classmethod
+    def short_title(cls, value: str | None) -> str | None:
+        if value:
+            title = " ".join(value.split())
+            if 2 <= len(title.split()) <= 5 and len(title) <= 120:
+                return title
+        return None

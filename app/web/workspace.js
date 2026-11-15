@@ -146,7 +146,8 @@ function updateControls() {
   byId("open-new-visit").disabled = busy || recording;
   byId("back-visits").disabled = busy || recording;
   byId("visit-list").inert = busy || recording;
-  byId("visit-label").readOnly = Boolean(visit) || busy || recording;
+  byId("visit-title").disabled = busy;
+  byId("rename-visit-input").readOnly = busy;
   byId("patient-mode").disabled = Boolean(visit) || busy || recording;
   byId("patient-name").disabled = Boolean(visit) || busy || recording;
   byId("patient-chart").disabled = Boolean(visit) || busy || recording;
@@ -255,7 +256,12 @@ function setScreen(next, focus = false) {
   byId("steps").hidden = next === "approved" || approved;
   byId("view-review").hidden = next !== "approved";
   byId("back-approved").hidden = next !== "review" || !approved;
-  byId("visit-title").textContent = next === "capture" ? visit?.label || "New visit" : visit.label;
+  byId("capture-title").hidden = next !== "capture";
+  byId("capture-title").textContent = visit?.label || "New visit";
+  byId("visit-title-text").textContent = visit?.label || "";
+  byId("visit-heading").hidden = false;
+  byId("visit-title").hidden = next === "capture";
+  byId("rename-visit-form").hidden = true;
   const prior = visit?.previous_visit;
   const priorLink = byId("previous-visit");
   priorLink.hidden = !prior;
@@ -273,7 +279,7 @@ function setScreen(next, focus = false) {
   }
   if (focus) {
     window.scrollTo(0, 0);
-    byId(next === "capture" ? "visit-label" : "visit-title").focus();
+    byId(next === "capture" && !visit ? "patient-name" : "visit-heading").focus();
   }
 }
 
@@ -288,7 +294,9 @@ function renderVisitList() {
     const state = create("span", "visit-dot");
     state.dataset.state = item.status;
     state.setAttribute("aria-hidden", "true");
-    button.append(title, state, create("span", "visit-meta", formatDate(item.created_at) + " · " + visitStates[item.status]));
+    button.append(title, state, create("span", "visit-meta", [
+      item.patient_name || "Unnamed patient", formatDate(item.created_at), visitStates[item.status],
+    ].join(" · ")));
     button.setAttribute("aria-current", String(item.id === visit?.id));
     list.append(button);
   }
@@ -309,6 +317,53 @@ byId("open-new-visit").addEventListener("click", startVisit);
 byId("back-visits").addEventListener("click", startVisit);
 byId("view-review").addEventListener("click", () => location.assign(pagePath(visit.id, "review")));
 byId("back-approved").addEventListener("click", () => location.assign(pagePath(visit.id, "approved")));
+
+function closeVisitRename() {
+  byId("rename-visit-form").hidden = true;
+  byId("visit-heading").hidden = false;
+  byId("visit-title").focus();
+}
+
+byId("visit-title").addEventListener("click", () => {
+  const input = byId("rename-visit-input");
+  input.value = visit.label;
+  input.setCustomValidity("");
+  byId("visit-heading").hidden = true;
+  byId("rename-visit-form").hidden = false;
+  input.focus();
+  input.select();
+});
+
+byId("rename-visit-input").addEventListener("input", event => event.target.setCustomValidity(""));
+byId("rename-visit-input").addEventListener("keydown", event => {
+  if (event.key === "Escape" && !busy) {
+    event.preventDefault();
+    closeVisitRename();
+  }
+});
+
+byId("rename-visit-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const input = byId("rename-visit-input");
+  const label = input.value.trim();
+  if (!label) {
+    input.setCustomValidity("Enter a title for this visit.");
+    input.reportValidity();
+    return;
+  }
+  let saved = false;
+  await work(async () => {
+    const renamed = await api(visitPath(), json("PATCH", { label }));
+    visit.label = renamed.label;
+    visit.label_edited = renamed.label_edited;
+    visits = visits.map(item => item.id === renamed.id ? renamed : item);
+    byId("visit-title-text").textContent = renamed.label;
+    renderVisitList();
+    say("Visit renamed.");
+    saved = true;
+  });
+  if (saved) closeVisitRename();
+});
 
 const isReturningPatient = () => document.querySelector('input[name="patient-mode"]:checked').value === "returning";
 const allergyText = allergy => allergy.reaction ? allergy.allergen + " · " + allergy.reaction : allergy.allergen;
@@ -354,7 +409,6 @@ function showVisit(data, reset = false, requestedPage) {
     byId("approval-phone").value = "";
     clearAudio();
   }
-  byId("visit-label").value = visit.label;
   updatePatientSelection();
   const language = visit.patient_language || visit.preferred_language || "en";
   byId("review-note-language").value = visit.note_language || "en";
@@ -847,15 +901,6 @@ byId("copy-summary").addEventListener("click", (event) => {
   copyText(visit.draft.visit_summary_for_patient, event.currentTarget);
 });
 
-function requireLabel() {
-  const label = byId("visit-label").value.trim();
-  if (!label) {
-    byId("visit-label").focus();
-    throw new Error("Enter a visit label before transcribing.");
-  }
-  return label;
-}
-
 function clearAudio() {
   selection = null;
   byId("file").value = "";
@@ -1040,7 +1085,6 @@ const chartLines = (id) => byId(id).value.split("\n").map(line => line.trim()).f
 
 byId("transcribe").addEventListener("click", () => work(async () => {
   if (!selection || recorder) return;
-  const label = requireLabel();
   if (!visit) {
     const patientId = byId("patient-chart").value;
     const patientName = byId("patient-name").value.trim();
@@ -1048,19 +1092,16 @@ byId("transcribe").addEventListener("click", () => work(async () => {
       byId("patient-chart").focus();
       throw new Error("Choose the returning patient’s saved chart.");
     }
-    if (!isReturningPatient() && !patientName) {
-      byId("patient-name").focus();
-      throw new Error("Enter the new patient’s name.");
-    }
     visit = await api("/api/visits", json("POST", {
-      label,
+      time_zone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       ...(isReturningPatient() ? { patient_id: patientId } : {
-        patient_name: patientName,
+        patient_name: patientName || null,
         allergies: chartLines("chart-allergies").map(allergen => ({ allergen })),
         current_medications: chartLines("chart-medications").map(name => ({ name })),
       }),
     }));
     updatePatientSelection();
+    byId("capture-title").textContent = visit.label;
     history.replaceState(null, "", pagePath(visit.id, "capture"));
     visits.unshift(visit);
     renderVisitList();

@@ -58,6 +58,7 @@ class SynthesizeResponse(BaseModel):
     soap_note: SOAPNote
     staged_orders: list[StagedOrder]
     visit_summary_for_patient: str
+    visit_title: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -72,6 +73,7 @@ class SynthesizeResponse(BaseModel):
             soap_note=synthesis.soap_note,
             staged_orders=synthesis.staged_orders,
             visit_summary_for_patient=synthesis.visit_summary_for_patient,
+            visit_title=synthesis.visit_title,
             created_at=doc.created_at,
             updated_at=doc.updated_at,
         )

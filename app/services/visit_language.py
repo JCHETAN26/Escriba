@@ -59,6 +59,7 @@ class LocalizedDraft(BaseModel):
     soap_note: SOAPNote | None
     order_wording: list[TranslatedOrder] | None
     patient_instructions: str | None
+    visit_title: str | None = None
 
 
 def classify_visit(english: int, spanish: int) -> tuple[DetectedLanguage, float]:
@@ -148,6 +149,8 @@ async def localize_draft(
     if note_language:
         data["note_language"] = note_language
         data["soap_note"] = draft.soap_note.model_dump()
+        if draft.visit_title:
+            data["visit_title"] = draft.visit_title
         data["order_wording"] = [
             {"description": order.description, "rationale": order.icd10_rationale}
             for order in draft.staged_orders
@@ -159,7 +162,8 @@ async def localize_draft(
     if note_language:
         language = LANGUAGE_NAMES[note_language]
         targets.append(
-            f"Write every soap_note section, order description and order rationale in {language}."
+            f"Write every soap_note section, order description, order rationale and any provided "
+            f"visit_title in {language}. Keep the title to 2 to 5 words and preserve its meaning."
         )
     if patient_language:
         targets.append(f"Write patient_instructions only in {LANGUAGE_NAMES[patient_language]}.")
@@ -188,6 +192,10 @@ async def localize_draft(
         if localized.soap_note is None or len(order_wording) != len(draft.staged_orders):
             raise LanguageUnavailableError("The translated note or order list was incomplete.")
         updates["soap_note"] = normalize_objective_placeholder(localized.soap_note, note_language)
+        if draft.visit_title and (
+            title := EncounterSynthesisResult.short_title(localized.visit_title)
+        ):
+            updates["visit_title"] = title
         orders = []
         for order, wording in zip(draft.staged_orders, order_wording, strict=True):
             orders.append(

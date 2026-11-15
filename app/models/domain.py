@@ -24,6 +24,7 @@ from sqlalchemy import (
     String,
     Text,
     Uuid,
+    false,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -192,7 +193,9 @@ class WorkspaceVisitDetails(Base):
     encounter_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("encounters.id", ondelete="CASCADE"), primary_key=True
     )
-    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    label: Mapped[str] = mapped_column(String(160), nullable=False)
+    label_edited: Mapped[bool] = mapped_column(default=False, server_default=false())
+    visit_title: Mapped[str | None] = mapped_column(String(120))
     language: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
 
 

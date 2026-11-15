@@ -155,7 +155,10 @@ def build_clinical_synthesis_messages(
     chart_language = "Spanish" if note_language == "es" else "English"
     language_instruction += (
         f" Write every sentence of all four SOAP sections, including Objective, entirely in "
-        f"{chart_language}. Write order descriptions and reasons in {chart_language}. Translate "
+        f"{chart_language}. Write order descriptions and reasons in {chart_language}. "
+        f"Write visit_title in {chart_language}, in 2 to 5 words based on the stated reason for "
+        "the visit. Do not use an unstated diagnosis or infer one from findings. Use null "
+        "if the transcript does not state a reason. Translate "
         "clinical findings spoken in another language into the required chart language. "
         "Do not embed untranslated source quotations in the SOAP note. "
         "Keep the order source quote field verbatim in the original transcript language. "
