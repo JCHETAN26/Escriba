@@ -1,0 +1,18 @@
+.env
+.env.*
+.git/
+.venv/
+.gstack/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+**/__pycache__/
+**/.DS_Store
+*.db
+*.db-*
+*.docx
+demo/
+design/
+design 2/
+frontend/
+tests/

@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.sessionmaker = build_sessionmaker(engine)
 
     if settings.auto_create_schema:
-        await create_schema(engine)
+        await create_schema(engine, hosted_demo=settings.hosted_demo)
         logger.info("Database schema ensured (auto_create_schema=true)")
 
     openai_client: AsyncOpenAI | None = None
@@ -63,9 +63,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="1.0.0",
         summary="Agentic clinical scribe: Autonomous Planning, Human Approval.",
         lifespan=lifespan,
-        docs_url=None if is_production else "/docs",
-        redoc_url=None if is_production else "/redoc",
-        openapi_url=None if is_production else "/openapi.json",
+        docs_url=None if is_production or settings.hosted_demo else "/docs",
+        redoc_url=None if is_production or settings.hosted_demo else "/redoc",
+        openapi_url=None if is_production or settings.hosted_demo else "/openapi.json",
     )
     app.state.settings = settings
     app.include_router(workspace.router)

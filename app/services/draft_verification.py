@@ -23,6 +23,7 @@ from app.services.guardrail import GuardrailService, GuardrailUnavailableError, 
 
 Area = Literal["subjective", "objective", "assessment", "plan", "patient_instructions", "order"]
 Status = Literal["supported", "flagged"]
+VERIFICATION_VERSION: Literal[3] = 3
 MEDICATION_FIELDS = ("dose", "route", "frequency", "duration")
 FIELDS: tuple[Area, ...] = ("subjective", "objective", "assessment", "plan", "patient_instructions")
 SENTENCE = re.compile(r"\n|(?<!\b\d\.)(?<=[.!?])\s+(?=[^\W\d_]|\d+[.)]\s)")
@@ -42,7 +43,12 @@ class Finding(BaseModel):
     id: str = ""
     severity: Literal["blocking", "question", "info"] = "info"
     kind: Literal[
-        "grounding", "language", "unsupported_order", "medication_safety", "undone_fix"
+        "grounding",
+        "language",
+        "unsupported_order",
+        "medication_safety",
+        "undone_fix",
+        "chart_withholding",
     ] = "grounding"
     chart_evidence: str | None = None
 
@@ -73,7 +79,7 @@ class Correction(BaseModel):
 class FindingResolution(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     finding_id: str = Field(min_length=1, max_length=64)
-    action: Literal["dropped", "overridden", "answered", "dismissed"]
+    action: Literal["dropped", "overridden", "answered", "dismissed", "not_a_direction"]
     note: str | None = Field(default=None, max_length=2000)
 
 
@@ -86,6 +92,21 @@ class PrescriptionDirection(BaseModel):
     order_index: int
     area: Literal["plan", "patient_instructions"]
     text: str
+    offset: int = 0
+    id: str = ""
+
+    @model_validator(mode="after")
+    def identify(self) -> PrescriptionDirection:
+        if not self.id:
+            identity = (
+                "prescription_direction",
+                self.order_index,
+                self.area,
+                self.text,
+                self.offset,
+            )
+            self.id = sha256(json.dumps(identity).encode()).hexdigest()[:24]
+        return self
 
 
 class VerificationReport(BaseModel):
@@ -96,7 +117,7 @@ class VerificationReport(BaseModel):
     prescription_count: int = 0
     prescription_directions: list[PrescriptionDirection] | None = None
     resolutions: list[ResolutionAudit] = Field(default_factory=list)
-    version: Literal[2] = 2
+    version: Literal[2, 3] = VERIFICATION_VERSION
 
 
 class ReviewedItem(BaseModel):
@@ -229,6 +250,9 @@ explicit decision, not a conditional discussion, and any attached quote must sup
 Grounding checks what was said, not whether the decision was medically appropriate. An allergy
 or safety concern does not invalidate clear transcript evidence of what was prescribed; medication
 safety and approval are checked separately. Never suggest a substitute medication.
+The supplied chart allergies and clinician's dropped prescriptions can support a statement that
+a named medication was withheld because of a documented allergy. Never use the chart as evidence
+that a medication was administered or that a follow-up instruction was stated.
 Supply short, verbatim transcript quotes as evidence, in their original language. Do not invent
 quotes. Supply multiple quotes if needed for a sentence with multiple claims.
 For every prescription list missing dose, route, and frequency. List missing duration only
@@ -245,10 +269,9 @@ on adequately supported items. Use an empty list of missing details for non-pres
 For each Plan and patient instruction item, independently of whether it is supported,
 set directs_prescription_indices to every proposed prescription it actively directs the
 clinician or patient to prescribe, start, take, continue, or resume. Include active
-directions with brand names, translations, conditional starts, and references such as
-"take it every day" when that means a listed prescription. Include statements of intent
-like "we are starting amlodipine." Exclude historical use, allergy mentions, and clear
-instructions NOT to take the drug. Use the full ordered text context to resolve references.
+directions with explicit drug, brand, or class names, including conditional starts. Include
+statements of intent like "we are starting amlodipine." Exclude historical use, unnamed
+medicines, allergy mentions, and instructions not to take the drug.
 Return an empty list for other items and when there is no active direction.
 """
 
@@ -293,6 +316,8 @@ async def _ground(
     transcript: str,
     summary_language: SummaryLanguage,
     note_language: SummaryLanguage,
+    chart: PatientContext,
+    dropped_prescriptions: frozenset[int],
 ) -> tuple[list[Finding], dict[Item, str], list[PrescriptionDirection]]:
     source = f" {words(transcript)} "
     items = _items(draft)
@@ -337,6 +362,10 @@ async def _ground(
                                 "transcript": transcript,
                                 "items": inputs,
                                 "proposed_prescriptions_by_index": prescriptions,
+                                "dropped_prescriptions": sorted(dropped_prescriptions),
+                                "chart_allergies": [
+                                    allergy.model_dump() for allergy in chart.allergies
+                                ],
                             },
                             ensure_ascii=False,
                         ),
@@ -363,19 +392,23 @@ async def _ground(
     neutral_flexion = _neutral_knee_flexion_evidence(transcript)
     for item in checked:
         verdict = verdicts[item.id]
+        chart_support = None
         if item.area in ("plan", "patient_instructions"):
             directions.extend(
-                PrescriptionDirection(order_index=index, area=item.area, text=item.text)
+                PrescriptionDirection(
+                    order_index=index, area=item.area, text=item.text, offset=item.start
+                )
                 for index, description in prescriptions.items()
-                if index in verdict.directs_prescription_indices
-                or _direct_medication_wording(item.text, description)
+                if _direct_medication_wording(item.text, description)
+            )
+            chart_support = _chart_withholding(
+                item.text, prescriptions, chart, dropped_prescriptions
             )
         evidence = _evidence(verdict.evidence, source)
         order = draft.staged_orders[item.order_index] if item.order_index is not None else None
         quote_ok = not order or bool(_evidence([order.transcript_timestamp_reference], source))
         supported = (
-            verdict.status == "supported"
-            and bool(evidence)
+            ((verdict.status == "supported" and bool(evidence)) or chart_support is not None)
             and quote_ok
             and not verdict.wrong_language
         )
@@ -417,13 +450,16 @@ async def _ground(
                 status="flagged" if question else "supported",
                 evidence=evidence,
                 question=question,
-                order_index=item.order_index,
+                order_index=chart_support[0] if supported and chart_support else item.order_index,
+                chart_evidence=chart_support[1] if supported and chart_support else None,
                 id=sha256(
                     json.dumps((item.area, item.text, item.start, item.order_index)).encode()
                 ).hexdigest()[:24],
                 kind=(
                     "language"
                     if verdict.wrong_language and quote_ok
+                    else "chart_withholding"
+                    if supported and chart_support
                     else "unsupported_order"
                     if order and not supported
                     else "grounding"
@@ -437,33 +473,121 @@ async def _ground(
 
 
 _START_WORDS = (
-    r"(?:start|starting|take|taking|continue|continuing|resume|prescribe|prescribed|begin|"
+    r"(?:starts?|starting|take|takes|taking|continues?|continuing|resumes?|"
+    r"resuming|prescribes?|prescribing|begins?|beginning|restart|restarting|use|"
     r"comience|comenzar|empiece|empezar|inicie|iniciar|tome|tomar|siga|"
     r"continúe|continuar|reanude|recetar)"
 )
+_PASSIVE_START = r"(?:started|taken|continued|resumed|prescribed|restarted|initiated)"
 _MEDICATION_PREFIX = re.compile(rf"^(?:{_START_WORDS} (?:a )?)+(?:el |la |the )?")
+_MEDICATION_ALIASES = (
+    (
+        ("amlodipine", "amlodipino", "norvasc"),
+        (
+            "calcium channel blocker",
+            "calcium channel blockers",
+            "ccb",
+            "dihydropyridine",
+            "dihydropyridine calcium channel blocker",
+            "bloqueador de los canales de calcio",
+        ),
+    ),
+    (
+        (
+            "bactrim",
+            "sulfamethoxazole trimethoprim",
+            "trimethoprim sulfamethoxazole",
+            "tmp smx",
+            "co trimoxazole",
+        ),
+        ("antibiotic", "sulfonamide antibiotic"),
+    ),
+)
+_NEGATED_DIRECTION = re.compile(
+    r"\b(?:not|never|no|without|avoid|hold|withhold|withheld|defer|deferred|stop|stopped|"
+    r"discontinue|discontinued|evite|evitar|suspenda|suspender|omita|"
+    r"wasn t|isn t|aren t|didn t|don t|doesn t|shouldn t|won t|cannot|can t)\b"
+)
+_NON_DIRECTIVE_CONTEXT = re.compile(
+    rf"\b(?:used to|previously|formerly|did|discussed|considered|"
+    rf"consider|asked about) (?:{_START_WORDS})\b"
+)
+
+
+def _drug_names(description: str, *, include_class: bool = True) -> set[str]:
+    normalized = _MEDICATION_PREFIX.sub("", words(description))
+    for names, classes in _MEDICATION_ALIASES:
+        if any(f" {name} " in f" {normalized} " for name in names):
+            return set(names + classes if include_class else names)
+    first = normalized.partition(" ")[0]
+    return {first} if first.isalpha() else set()
+
+
+def _drug_pattern(names: set[str]) -> str:
+    return (
+        "(?:" + "|".join(map(re.escape, sorted(names, key=lambda name: (-len(name), name)))) + ")"
+    )
 
 
 def _direct_medication_wording(text: str, description: str) -> bool:
-    """Catch explicit named directions even if the semantic pass misses one."""
-    normalized = _MEDICATION_PREFIX.sub("", words(description))
-    if not normalized or not (name := normalized.split()[0]).isalpha():
+    """Require the drug and an affirmative instruction within the same clause."""
+    names = _drug_names(description)
+    if not names:
         return False
-    aliases = {name}
-    if len(name) > 5 and name.endswith(("ine", "ino", "ina")):
-        aliases.update(name[:-1] + ending for ending in ("e", "o", "a"))
-    drug = "(?:" + "|".join(map(re.escape, sorted(aliases))) + ")"
-    clause = re.sub(r"^\d+ ", "", words(text))
-    return bool(
-        re.search(
-            rf"^(?:(?:you (?:can|should|are to|will) |we (?:will|are) |please "
-            rf"|the clinician (?:(?:instructs|instructed) the patient to |states they are )?"
-            rf"|puede |debe |vamos a )?"
-            rf"(?:{_START_WORDS} (?:a )?)+(?:el |la |the )?{drug}\b"
-            rf"|{drug} \d)",
-            clause,
-        )
+    drug = _drug_pattern(names)
+    action = re.compile(
+        rf"\b(?:{_START_WORDS} (?:a )?)+(?:el |la |the |your |su )?"
+        rf"(?:(?:\d+(?: \d+)?|one|two|half) (?:mg|mcg|ml|tablets?|capsules?) of )?{drug}\b"
+        rf"|\b{drug}\b(?: \d+(?: \d+)? (?:mg|mcg|ml))? "
+        rf"(?:(?:will|should|must|is to) be|to be) {_PASSIVE_START}\b"
     )
+    heading = re.compile(rf"^\s*{drug}\s*:\s*({_START_WORDS})\b", re.IGNORECASE)
+    if heading.search(text):
+        return True
+    clauses = re.split(r"[;!?\n]|\b(?:but|however|pero|sino)\b", text, flags=re.IGNORECASE)
+    for clause in map(words, clauses):
+        # An affirmative direction may follow a separate negative instruction.
+        for instruction in re.split(rf"\b(?:and|y) (?={_START_WORDS} )", clause):
+            match = action.search(instruction)
+            if (
+                match
+                and not _NEGATED_DIRECTION.search(instruction[: match.start()])
+                and not _NON_DIRECTIVE_CONTEXT.search(instruction)
+            ):
+                return True
+    return False
+
+
+_WITHHELD_DUE_TO_ALLERGY = re.compile(
+    rf"(?:(?P<drug>.+?) (?:(?:was|is|will be) )?(?:not {_PASSIVE_START}|"
+    rf"held|withheld|deferred)|(?:do not {_START_WORDS}|hold|avoid|withhold) (?P<avoid>.+?)) "
+    r"(?:because of|due to) (?:a |an |the |your )?(?:documented |known )?"
+    r"allergy(?: (?P<reaction>.+))?"
+)
+_REACTIONS = {"urticaria": "hives", "ronchas": "hives"}
+
+
+def _chart_withholding(
+    text: str, prescriptions: dict[int, str], chart: PatientContext, dropped: frozenset[int]
+) -> tuple[int, str] | None:
+    match = _WITHHELD_DUE_TO_ALLERGY.fullmatch(words(text))
+    if not match:
+        return None
+    drug = match["drug"] or match["avoid"]
+    reaction = match["reaction"] or ""
+    for index in sorted(dropped & prescriptions.keys()):
+        names = _drug_names(prescriptions[index], include_class=False)
+        if drug not in names:
+            continue
+        for allergy in chart.allergies:
+            if words(allergy.allergen) not in names:
+                continue
+            recorded = words(allergy.reaction or "")
+            if not reaction or _REACTIONS.get(reaction, reaction) == _REACTIONS.get(
+                recorded, recorded
+            ):
+                return index, "Allergy: " + allergy.display()
+    return None
 
 
 def _repair(
@@ -578,6 +702,7 @@ async def verify_draft(
     summary_language: SummaryLanguage = "en",
     note_language: SummaryLanguage = "en",
     progress: Callable[[str], None] | None = None,
+    dropped_prescriptions: frozenset[int] = frozenset(),
 ) -> tuple[EncounterSynthesisResult, VerificationReport]:
     started = monotonic()
     trace: list[str] = []
@@ -589,7 +714,14 @@ async def verify_draft(
 
     step("Checking draft wording and prescription details against the transcript.")
     findings, replacements, directions = await _ground(
-        client, settings, draft, transcript, summary_language, note_language
+        client,
+        settings,
+        draft,
+        transcript,
+        summary_language,
+        note_language,
+        chart,
+        dropped_prescriptions,
     )
     step(f"Checked {len(findings)} draft sentences and orders against the transcript.")
     corrections: list[Correction] = []
@@ -600,7 +732,14 @@ async def verify_draft(
         step(f"Re-checking {len(replacements)} proposed edits against the transcript.")
         try:
             reviewed, next_replacements, reviewed_directions = await _ground(
-                client, settings, candidate, transcript, summary_language, note_language
+                client,
+                settings,
+                candidate,
+                transcript,
+                summary_language,
+                note_language,
+                chart,
+                dropped_prescriptions,
             )
         except VerificationUnavailableError:
             step("Could not re-check proposed edits. Kept the current wording.")

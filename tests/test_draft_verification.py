@@ -150,7 +150,10 @@ async def test_fabricated_quote_and_missing_item_cannot_pass() -> None:
     [
         ("Start Bactrim.", "Take Bactrim daily.", False, {"plan", "patient_instructions"}),
         ("Start Bactrim.", "Take your antibiotic daily.", True, {"plan", "patient_instructions"}),
-        ("Do not start Bactrim.", "Do not take Bactrim.", False, set()),
+        ("Do not start Bactrim.", "Do not take Bactrim.", True, set()),
+        ("Hold Bactrim.", "Avoid Bactrim.", True, set()),
+        ("Return in two weeks.", "Take it daily.", True, set()),
+        ("Bactrim 5 mg.", "You used to take Bactrim.", True, set()),
     ],
 )
 async def test_links_only_active_prescription_directions(
@@ -176,6 +179,79 @@ async def test_links_only_active_prescription_directions(
     )
     assert report.prescription_directions is not None
     assert {item.area for item in report.prescription_directions} == expected_areas
+
+
+@pytest.mark.parametrize("text", ["Start Norvasc.", "Continue the calcium channel blocker."])
+async def test_amlodipine_brand_and_class_are_direction_candidates(text: str) -> None:
+    fake = FakeOpenAI()
+    fake.completions.responses.extend([pass_result(repaired=True), '{"alert": null}'])
+    draft = DRAFT.model_copy(
+        update={
+            "soap_note": DRAFT.soap_note.model_copy(update={"plan": text}),
+            "staged_orders": [
+                DRAFT.staged_orders[0].model_copy(update={"description": "Amlodipine 5 mg"})
+            ],
+        }
+    )
+    _, report = await verify_draft(
+        cast(AsyncOpenAI, fake),
+        Settings(_env_file=None, twilio_validate_signature=False),
+        draft,
+        TRANSCRIPT,
+        PatientContext(patient_id=uuid.uuid4()),
+        repair=False,
+    )
+    assert [(mark.area, mark.text) for mark in report.prescription_directions or []] == [
+        ("plan", text)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("dropped", "reaction"), [(True, "hives"), (False, "hives"), (True, "rash")]
+)
+async def test_dropped_amlodipine_withholding_uses_chart_evidence(
+    dropped: bool, reaction: str
+) -> None:
+    text = "Amlodipine not started because of a documented allergy (hives)."
+    followup = "Return in two weeks."
+    fake = FakeOpenAI()
+    result = pass_result(repaired=True)
+    order = result["items"].pop()
+    order["id"] = 6
+    result["items"][3].update(status="flagged", evidence=[], directs_prescription_indices=[0])
+    result["items"][4].update(evidence=[followup], directs_prescription_indices=[0])
+    result["items"].append(dict(result["items"][4], id=5))
+    result["items"].append(order)
+    fake.completions.responses.extend([result, '{"alert": null}'])
+    draft = DRAFT.model_copy(
+        update={
+            "soap_note": DRAFT.soap_note.model_copy(update={"plan": f"{text} {followup}"}),
+            "visit_summary_for_patient": followup,
+            "staged_orders": [
+                DRAFT.staged_orders[0].model_copy(update={"description": "Amlodipine 5 mg"})
+            ],
+        }
+    )
+    _, report = await verify_draft(
+        cast(AsyncOpenAI, fake),
+        Settings(_env_file=None, twilio_validate_signature=False),
+        draft,
+        f"{TRANSCRIPT} {followup}",
+        PatientContext(
+            patient_id=uuid.uuid4(), allergies=(Allergy(allergen="amlodipine", reaction=reaction),)
+        ),
+        repair=False,
+        dropped_prescriptions=frozenset({0}) if dropped else frozenset(),
+    )
+    assert report.prescription_directions == []
+    finding = next(item for item in report.findings if item.text == text)
+    if dropped and reaction == "hives":
+        assert finding.status == "supported"
+        assert finding.evidence == []
+        assert finding.chart_evidence == "Allergy: amlodipine (reaction: hives)"
+    else:
+        assert finding.status == "flagged"
+        assert finding.chart_evidence is None
 
 
 async def test_wrong_language_is_distinct_from_unsupported_meaning() -> None:

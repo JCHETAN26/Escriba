@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     database_max_overflow: int = Field(default=20, ge=0)
     auto_create_schema: bool = True
     demo_mode: bool = False
+    hosted_demo: bool = False
 
     twilio_account_sid: str | None = None
     twilio_auth_token: SecretStr | None = None
@@ -77,6 +78,24 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _enforce_production_safety(self) -> Settings:
+        if self.hosted_demo:
+            if self.environment != "staging":
+                raise ValueError("Hosted demo mode requires ESCRIBA_ENVIRONMENT=staging.")
+            if not self.database_url.startswith("postgresql+asyncpg://"):
+                raise ValueError("Hosted demo mode requires a separate PostgreSQL database.")
+            public_url = self.public_base_url
+            if (
+                public_url is None
+                or public_url.scheme != "https"
+                or public_url.path not in (None, "/")
+                or public_url.query is not None
+                or public_url.fragment is not None
+                or public_url.username is not None
+                or public_url.password is not None
+            ):
+                raise ValueError("Set ESCRIBA_PUBLIC_BASE_URL to the hosted demo HTTPS origin.")
+            if self.openai_api_key is None:
+                raise ValueError("Hosted demo mode requires ESCRIBA_OPENAI_API_KEY.")
         if self.demo_mode and self.environment != "development":
             raise ValueError("Demo mode is available only in development.")
         if self.twilio_validate_signature and self.twilio_auth_token is None:

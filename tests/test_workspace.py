@@ -1,6 +1,9 @@
 """Regression coverage for visit capture, editing, and approval."""
 
+import sqlite3
+from contextlib import closing
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,13 +12,14 @@ from pytest import MonkeyPatch
 from app.core.config import Settings
 from app.main import create_app
 from app.routers import workspace
-from app.schemas.clinical import EncounterSynthesisResult
+from app.schemas.clinical import Allergy, EncounterSynthesisResult, SOAPNote
 from app.services.draft_verification import (
     Correction,
     Finding,
     PrescriptionDirection,
     VerificationReport,
 )
+from app.services.guardrail import PatientContext
 from app.services.outreach import OutreachService, SmsUnavailableError
 from app.services.recording import RecordingTranscript, TranscriptSegment
 from tests.fakes import FakeOpenAI
@@ -23,8 +27,256 @@ from tests.fakes import FakeOpenAI
 WORKSPACE = {"X-Escriba-Workspace": "1"}
 
 
-def test_dropped_prescription_cannot_be_approved_or_texted(
+def test_hosted_recording_chunks_are_validated_reassembled_and_removed(
     tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    origin = "https://escriba.example"
+    database = tmp_path / "uploads.db"
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{database}",
+        public_base_url=origin,
+        twilio_validate_signature=False,
+    )
+    app = create_app(settings)
+    first = b"a" * 3_000_000
+    last = b"b" * 2_614_474
+
+    async def transcribe(_client, _settings, audio, extension):
+        assert extension == "wav"
+        assert audio == first + last
+        return RecordingTranscript("Synthetic visit", [])
+
+    async def tag(_client, _settings, _recording):
+        return "en", 1.0
+
+    monkeypatch.setattr(workspace, "transcribe_recording", transcribe)
+    monkeypatch.setattr(workspace, "tag_recording", tag)
+    with TestClient(app, base_url=origin) as client:
+        app.state.settings = settings.model_copy(update={"hosted_demo": True})
+        app.state.openai_client = FakeOpenAI()
+        config = client.get("/api/visits/config").json()
+        assert config["max_audio_bytes"] == 25_000_000
+        assert config["audio_chunk_bytes"] == len(first)
+        headers = {**WORKSPACE, "Origin": origin, "X-Audio-Format": "wav"}
+        visit = client.post("/api/visits", headers=headers, json={"label": "Chunk upload"})
+        assert visit.is_success, visit.text
+        route = f"/api/visits/{visit.json()['id']}/recording/chunks"
+        upload = {"upload_id": str(uuid4())}
+        params = {**upload, "total_bytes": len(first) + len(last)}
+        assert (
+            client.put(
+                f"{route}/0",
+                headers=headers,
+                content=first,
+                params={
+                    **upload,
+                    "total_bytes": 25_000_001,
+                },
+            ).status_code
+            == 422
+        )
+        assert (
+            client.put(
+                f"{route}/0", headers=headers, content=first + b"x", params=params
+            ).status_code
+            == 413
+        )
+        for _ in range(2):
+            part = client.put(f"{route}/0", headers=headers, content=first, params=params)
+            assert part.is_success, part.text
+        assert client.post(f"{route}/complete", headers=headers, params=upload).status_code == 409
+        guest_cookies = dict(client.cookies)
+        client.cookies.clear()
+        assert (
+            client.put(f"{route}/1", headers=headers, content=last, params=params).status_code
+            == 404
+        )
+        client.cookies.clear()
+        client.cookies.update(guest_cookies)
+        part = client.put(f"{route}/1", headers=headers, content=last, params=params)
+        assert part.is_success, part.text
+        done = client.post(f"{route}/complete", headers=headers, params=upload)
+        assert done.is_success, done.text
+        assert done.json()["transcript"] == "Synthetic visit"
+        assert client.post(f"{route}/complete", headers=headers, params=upload).status_code == 409
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute("SELECT count(*) FROM recording_upload_chunks").fetchone() == (0,)
+
+
+def test_hosted_demo_keeps_guest_charts_separate(tmp_path: Path) -> None:
+    origin = "https://escriba.example"
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'guest.db'}",
+        public_base_url=origin,
+        twilio_validate_signature=False,
+    )
+    app = create_app(settings)
+    with TestClient(app, base_url=origin) as client:
+        # Use a local test database with the hosted request handling enabled.
+        app.state.settings = settings.model_copy(
+            update={"hosted_demo": True, "environment": "staging"}
+        )
+        config = client.get("/api/visits/config")
+        assert config.json()["hosted_demo"] is True
+        cookie = config.headers["set-cookie"]
+        assert all(flag in cookie for flag in ("__Host-escriba-demo=", "Secure", "HttpOnly"))
+        headers = {**WORKSPACE, "Origin": origin}
+        visit = client.post(
+            "/api/visits",
+            json={"label": "Prior visit", "patient_name": "Morgan"},
+            headers=headers,
+        )
+        assert visit.is_success, visit.text
+        visit_id = visit.json()["id"]
+        patient_id = visit.json()["patient_id"]
+        assert client.get(f"/api/visits/{visit_id}").is_success
+        assert client.get("/api/patients").json()[0]["id"] == patient_id
+        assert (
+            client.post(
+                "/api/visits",
+                json={"label": "Cross-origin attempt"},
+                headers={**WORKSPACE, "Origin": "https://elsewhere.example"},
+            ).status_code
+            == 403
+        )
+
+        client.cookies.clear()
+        assert client.get("/api/patients").json() == []
+        assert client.get(f"/api/visits/{visit_id}").status_code == 404
+        assert (
+            client.post(
+                "/api/visits",
+                json={"label": "Returning visit", "patient_id": patient_id},
+                headers=headers,
+            ).status_code
+            == 404
+        )
+
+
+def test_returning_patient_reuses_allergy_and_keeps_visit_details(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'returning.db'}",
+        twilio_validate_signature=False,
+    )
+    chart_contexts: list[PatientContext] = []
+
+    async def transcribe(_client, _settings, audio, _extension):
+        return RecordingTranscript(audio.decode(), [])
+
+    async def tag(_client, _settings, recording):
+        return ("en" if "hives" in recording.text else "es"), 1.0
+
+    async def draft(_client, _settings, _transcript, _chart, **_kwargs):
+        return EncounterSynthesisResult(
+            soap_note=SOAPNote(
+                subjective="Patient reported a prior medication reaction.",
+                objective="No exam documented.",
+                assessment="Medication reaction.",
+                plan="Review the reaction.",
+            ),
+            visit_summary_for_patient="We reviewed your medication history.",
+            staged_orders=[],
+        )
+
+    async def verify(_client, _settings, note, _transcript, chart, **_kwargs):
+        chart_contexts.append(chart)
+        return note, VerificationReport(findings=[], trace=[])
+
+    monkeypatch.setattr(workspace, "transcribe_recording", transcribe)
+    monkeypatch.setattr(workspace, "tag_recording", tag)
+    monkeypatch.setattr(workspace, "generate_draft", draft)
+    monkeypatch.setattr(workspace, "verify_draft", verify)
+    app = create_app(settings)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 54321)) as client:
+        app.state.openai_client = FakeOpenAI()
+
+        def call(method, path, **kwargs):
+            response = client.request(method, path, headers=WORKSPACE, **kwargs)
+            assert response.is_success, response.text
+            return response.json()
+
+        def prepare(route, words):
+            recorded = client.put(
+                route + "/recording",
+                content=words,
+                headers={**WORKSPACE, "X-Audio-Format": "wav"},
+            )
+            assert recorded.is_success, recorded.text
+            generated = call("POST", route + "/draft")
+            return call(
+                "POST",
+                route + "/verify",
+                json={
+                    "revision": generated["draft"]["updated_at"],
+                },
+            )
+
+        first = call("POST", "/api/visits", json={"label": "First visit", "patient_name": "Morgan"})
+        prior = f"/api/visits/{first['id']}"
+        checked = prepare(prior, b"Amlodipine gave me hives.")
+        assert chart_contexts[-1].allergies == ()
+        documented = call(
+            "POST",
+            prior + "/allergies",
+            json={
+                "allergen": "amlodipine",
+                "reaction": "hives",
+            },
+        )
+        assert documented["verification"] is None
+        assert documented["draft"]["updated_at"] != checked["draft"]["updated_at"]
+        checked = call(
+            "POST",
+            prior + "/verify",
+            json={
+                "revision": documented["draft"]["updated_at"],
+            },
+        )["draft"]
+        call(
+            "PUT",
+            prior + "/review",
+            json={
+                "revision": checked["updated_at"],
+                "soap_note": checked["soap_note"],
+                "visit_summary_for_patient": checked["visit_summary_for_patient"],
+                "clinician": "Demo clinician",
+            },
+        )
+        charts = call("GET", "/api/patients")
+        assert [(chart["id"], chart["label"]) for chart in charts] == [
+            (first["patient_id"], "Morgan"),
+        ]
+        followup = call(
+            "POST",
+            "/api/visits",
+            json={
+                "label": "Return visit",
+                "patient_id": first["patient_id"],
+            },
+        )
+        assert followup["previous_visit"]["id"] == first["id"]
+        assert followup["allergies"] == [{"allergen": "amlodipine", "reaction": "hives"}]
+        checked = prepare(f"/api/visits/{followup['id']}", b"Vamos a iniciar amlodipino.")
+        assert checked["note_language"] == "es"
+        assert chart_contexts[-1].allergies == (Allergy(allergen="amlodipine", reaction="hives"),)
+        assert call("GET", prior)["note_language"] == "en"
+        assert call("GET", prior)["label"] == "First visit"
+
+        same_name = call(
+            "POST", "/api/visits", json={"label": "First visit", "patient_name": "Morgan"}
+        )
+        assert same_name["patient_id"] != first["patient_id"]
+        assert same_name["allergies"] == []
+
+
+@pytest.mark.parametrize("dismiss_marks", [False, True])
+def test_dropped_prescription_cannot_be_approved_or_texted(
+    tmp_path: Path, monkeypatch: MonkeyPatch, dismiss_marks: bool
 ) -> None:
     settings = Settings(
         _env_file=None,
@@ -117,7 +369,12 @@ def test_dropped_prescription_cannot_be_approved_or_texted(
             (original_plan, original_summary, "Plan and patient instructions"),
             ("Return in two weeks.", original_summary, "patient instructions"),
             (original_plan, "Return in two weeks.", "Plan"),
-            ("Return in two weeks.", "Return in two weeks.", None),
+            (
+                "Amlodipine not started because of a documented allergy (hives). "
+                "Return in two weeks.",
+                "Return in two weeks.",
+                None,
+            ),
         ]:
             body = {
                 "revision": draft["updated_at"],
@@ -151,6 +408,20 @@ def test_dropped_prescription_cannot_be_approved_or_texted(
                 assert approved.status_code == 409, approved.text
                 assert f"the {blocked_sections} before" in approved.json()["detail"]
                 assert submitted == []
+                if dismiss_marks:
+                    marks = checked.json()["verification"]["prescription_directions"]
+                    for mark in marks:
+                        body["resolutions"].append(
+                            {"finding_id": mark["id"], "action": "not_a_direction"}
+                        )
+                        approved = client.put(route + "/review", headers=WORKSPACE, json=body)
+                        assert approved.status_code == (200 if mark == marks[-1] else 409)
+                    audit = approved.json()["verification"]["resolutions"]
+                    assert {
+                        item["finding_id"] for item in audit if item["action"] == "not_a_direction"
+                    } == {mark["id"] for mark in marks}
+                    assert approved.json()["draft"]["staged_orders"] == []
+                    break
             else:
                 assert approved.status_code == 200, approved.text
                 assert approved.json()["draft"]["staged_orders"] == []
@@ -236,6 +507,7 @@ def test_recording_to_approved_note(
         summary_language="en",
         note_language="en",
         progress=None,
+        dropped_prescriptions=frozenset(),
     ):
         return draft, VerificationReport(
             findings=[
@@ -288,7 +560,8 @@ def test_recording_to_approved_note(
         assert client.get("/visits/new").status_code == 200
         documented_paths = client.get("/openapi.json").json()["paths"]
         assert all(
-            path.startswith("/api/visits") or path == "/healthz" for path in documented_paths
+            path.startswith("/api/visits") or path in {"/api/patients", "/healthz"}
+            for path in documented_paths
         )
         create = client.post(
             "/api/visits",

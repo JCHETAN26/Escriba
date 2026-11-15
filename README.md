@@ -48,6 +48,31 @@ The workspace API and health check are exposed by default. Set
 `ESCRIBA_DEMO_MODE=true` in development to mount the legacy encounter,
 document, webhook, and outreach routes described below.
 
+## Host the hackathon demo on Vercel
+
+Link the Escriba project in Vercel and connect a dedicated Neon PostgreSQL database
+to its Production environment. Vercel exposes the connection URL as
+`DATABASE_URL` or `DATABASE_URL_UNPOOLED`. You can also set
+`ESCRIBA_DATABASE_URL` to a separate `postgresql+asyncpg://` connection URL.
+Use a blank database for the demo.
+
+Set these Production environment variables before running `vercel deploy --prod`:
+
+| Variable | Value |
+| --- | --- |
+| `ESCRIBA_ENVIRONMENT` | `staging` |
+| `ESCRIBA_HOSTED_DEMO` | `true` |
+| `ESCRIBA_PUBLIC_BASE_URL` | The production demo's HTTPS origin |
+| `ESCRIBA_OPENAI_API_KEY` | A sensitive server-side environment variable |
+| `ESCRIBA_TWILIO_VALIDATE_SIGNATURE` | `false` |
+
+Open the production URL in a private window to confirm guest access. The hosted
+demo uses a browser cookie to keep visits and returning-patient charts together
+for that browser. It accepts fictional recordings up to 25 MB and disables SMS.
+For larger uploads, the browser sends 3 MB chunks that Neon holds until Escriba
+assembles the recording. Unfinished uploads expire after one hour and are cleared
+when another chunked upload starts.
+
 ## The 5-Phase End-to-End Architecture
 
 ```

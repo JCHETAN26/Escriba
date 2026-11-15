@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
 from fastapi import Depends
-from sqlalchemy import MetaData, event
+from sqlalchemy import MetaData, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -73,12 +73,15 @@ def build_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
 
 
-async def create_schema(engine: AsyncEngine) -> None:
+async def create_schema(engine: AsyncEngine, *, hosted_demo: bool = False) -> None:
     """Create all tables. Development convenience only; production uses migrations."""
     # Import for side effects so every model is registered on Base.metadata.
     import app.models  # noqa: F401
 
     async with engine.begin() as conn:
+        if hosted_demo:
+            # Serialize table initialization when Vercel starts concurrent instances.
+            await conn.execute(text("SELECT pg_advisory_xact_lock(561023849)"))
         await conn.run_sync(Base.metadata.create_all)
 
 

@@ -2,7 +2,10 @@
 
 const byId = (id) => document.getElementById(id);
 const fields = ["subjective", "objective", "assessment", "plan"];
-const maxAudioBytes = 25_000_000;
+let maxAudioBytes = 25_000_000;
+let audioChunkBytes = 0;
+const audioLimit = () => maxAudioBytes / 1_000_000 + " MB";
+const audioLabel = () => "MP3, M4A, WAV or WebM · up to " + audioLimit();
 const audioFormats = new Set(["flac", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "wav", "webm"]);
 const visitStates = {
   scheduled: "Ready to capture",
@@ -12,6 +15,7 @@ const visitStates = {
 };
 const editors = new Map();
 let visits = [];
+let patientCharts = [];
 let visit = null;
 let screen = "capture";
 let decisions = [];
@@ -81,13 +85,20 @@ function currentVerification() {
   return matchesSavedDraft() ? visit.verification : null;
 }
 
-function prescriptionReconciliation(report) {
-  if (visit?.draft?.status === "approved") return { recheck: false, directions: [] };
-  const dropped = (visit?.draft?.staged_orders || []).flatMap((order, index) =>
+function droppedPrescriptions() {
+  return (visit?.draft?.staged_orders || []).flatMap((order, index) =>
     order.order_type === "prescription" && decisions[index] === "drop" ? [index] : []);
+}
+
+function prescriptionReconciliation(report) {
+  const dropped = droppedPrescriptions();
+  const marks = (report?.prescription_directions || []).filter(item => dropped.includes(item.order_index));
   return {
     recheck: dropped.length > 0 && !report?.prescription_directions,
-    directions: (report?.prescription_directions || []).filter(item => dropped.includes(item.order_index)),
+    marks,
+    directions: marks.filter(item => !findingDecision(item)),
+    keptWithheld: report?.findings.some(item => item.kind === "chart_withholding"
+      && decisions[item.order_index] === "keep"),
   };
 }
 
@@ -110,9 +121,10 @@ function updateApproval() {
     : undecided ? undecided + (undecided === 1 ? " needs a decision" : " need a decision") : "";
   byId("approve").disabled = busy || undecided > 0 || !hasReviewer || needsPhone
     || !verification || unsupported || open.length > 0 || wrongLanguage
-    || reconciliation.recheck || reconciliation.directions.length > 0;
+    || reconciliation.recheck || reconciliation.keptWithheld || reconciliation.directions.length > 0;
   byId("approval-hint").textContent = reconciliation.directions.length
-    ? "Edit the flagged instructions for the dropped prescription, then save & verify."
+    ? "Edit the flagged instructions and save & verify, or dismiss an incorrect mark."
+    : reconciliation.keptWithheld ? "Drop the prescription documented as withheld."
     : reconciliation.recheck ? "Verify the Plan and patient instructions again after dropping this prescription."
     : wrongLanguage ? "Correct the flagged language mismatch and verify again."
     : !verification
@@ -135,6 +147,9 @@ function updateControls() {
   byId("back-visits").disabled = busy || recording;
   byId("visit-list").inert = busy || recording;
   byId("visit-label").readOnly = Boolean(visit) || busy || recording;
+  byId("patient-mode").disabled = Boolean(visit) || busy || recording;
+  byId("patient-name").disabled = Boolean(visit) || busy || recording;
+  byId("patient-chart").disabled = Boolean(visit) || busy || recording;
   byId("chart-allergies").readOnly = Boolean(visit) || busy;
   byId("chart-medications").readOnly = Boolean(visit) || busy;
   byId("review").inert = busy;
@@ -241,6 +256,13 @@ function setScreen(next, focus = false) {
   byId("view-review").hidden = next !== "approved";
   byId("back-approved").hidden = next !== "review" || !approved;
   byId("visit-title").textContent = next === "capture" ? visit?.label || "New visit" : visit.label;
+  const prior = visit?.previous_visit;
+  const priorLink = byId("previous-visit");
+  priorLink.hidden = !prior;
+  if (prior) {
+    priorLink.href = pagePath(prior.id, "review");
+    priorLink.textContent = "Prior visit on this chart · " + formatDate(prior.created_at);
+  }
   const badge = byId("visit-status");
   badge.hidden = next === "capture";
   badge.textContent = approved ? "Approved · locked" : "Draft · needs review";
@@ -280,13 +302,42 @@ function hasUnsavedWork() {
 function startVisit() {
   if (busy || recorder) return;
   if (visit) location.assign("/visits/new");
-  else byId("visit-label").focus();
+  else byId("patient-name").focus();
 }
 
 byId("open-new-visit").addEventListener("click", startVisit);
 byId("back-visits").addEventListener("click", startVisit);
 byId("view-review").addEventListener("click", () => location.assign(pagePath(visit.id, "review")));
 byId("back-approved").addEventListener("click", () => location.assign(pagePath(visit.id, "approved")));
+
+const isReturningPatient = () => document.querySelector('input[name="patient-mode"]:checked').value === "returning";
+const allergyText = allergy => allergy.reaction ? allergy.allergen + " · " + allergy.reaction : allergy.allergen;
+
+function updatePatientSelection() {
+  const returning = isReturningPatient();
+  byId("patient-mode").hidden = Boolean(visit);
+  byId("new-patient-fields").hidden = returning || Boolean(visit);
+  byId("returning-patient-fields").hidden = !returning || Boolean(visit);
+  byId("capture-chart-inputs").hidden = returning && !visit;
+  const chosen = patientCharts.find(chart => chart.id === byId("patient-chart").value);
+  byId("returning-allergies").textContent = chosen
+    ? (chosen.allergies.map(allergyText).join(", ") || "No allergies documented on this chart.")
+    : "";
+}
+
+byId("patient-mode").addEventListener("change", () => {
+  updatePatientSelection();
+  if (!isReturningPatient()) return;
+  work(async () => {
+    patientCharts = await api("/api/patients");
+    const select = byId("patient-chart");
+    const placeholder = new Option(patientCharts.length ? "Choose a patient" : "No saved patient charts", "");
+    select.replaceChildren(placeholder, ...patientCharts.map(chart =>
+      new Option(chart.label + " · Last visit " + formatDate(chart.last_visit_at), chart.id)));
+    updatePatientSelection();
+  });
+});
+byId("patient-chart").addEventListener("change", updatePatientSelection);
 
 function showVisit(data, reset = false, requestedPage) {
   const firstDraft = !visit?.draft && Boolean(data.draft);
@@ -304,6 +355,7 @@ function showVisit(data, reset = false, requestedPage) {
     clearAudio();
   }
   byId("visit-label").value = visit.label;
+  updatePatientSelection();
   const language = visit.patient_language || visit.preferred_language || "en";
   byId("review-note-language").value = visit.note_language || "en";
   byId("review-patient-language").value = language;
@@ -315,7 +367,11 @@ function showVisit(data, reset = false, requestedPage) {
     byId("detected-language").textContent += language === "es"
       ? " → patient message in Spanish" : " → patient message in English";
   }
-  byId("chart-allergies").value = (visit.allergies || []).map(allergy => allergy.allergen).join("\n");
+  byId("chart-allergies").value = (visit.allergies || []).map(allergyText).join("\n");
+  byId("review-patient").textContent = visit.patient_name || visit.label;
+  const allergies = visit.allergies || [];
+  byId("saved-allergies").replaceChildren(...(allergies.length ? allergies.map(allergyText)
+    : ["No allergies documented."]).map(text => create("li", "", text)));
   byId("chart-medications").value = (visit.current_medications || []).map(med =>
     [med.name, med.dosage, med.frequency].filter(Boolean).join(" ")).join("\n");
   byId("review-language").textContent = language === "es" ? "Español" : "English";
@@ -340,6 +396,7 @@ function showVisit(data, reset = false, requestedPage) {
   byId("change-language").hidden = approved;
   byId("approval").hidden = approved;
   byId("review-locked").hidden = !approved;
+  byId("save-allergy").hidden = approved;
   byId("edit-hint").hidden = approved;
   if (!approved && visit.verification) decisions.forEach((decision, index) => {
     if (decision === "drop") chooseOrder(index, "drop");
@@ -377,11 +434,16 @@ function chooseOrder(index, decision) {
   if (index === null) return;
   decisions[index] = decision;
   for (const finding of visit.verification?.findings || []) {
-    if (finding.order_index !== index || finding.severity !== "blocking") continue;
+    if (finding.order_index !== index || finding.area !== "order" || finding.severity === "info") continue;
     if (decision === "drop") {
       resolutions.set(finding.id, { finding_id: finding.id, action: "dropped" });
     } else if (resolutions.get(finding.id)?.action === "dropped") {
       resolutions.delete(finding.id);
+    }
+  }
+  if (decision !== "drop") {
+    for (const mark of visit.verification?.prescription_directions || []) {
+      if (mark.order_index === index) resolutions.delete(mark.id);
     }
   }
 }
@@ -401,7 +463,7 @@ function findingEntry(finding, approved) {
   const decision = findingDecision(finding);
   entry.dataset.state = decision ? "resolved" : finding.severity;
   entry.open = !decision && finding.status === "flagged";
-  const area = finding.order_index !== null ? "Order " + (finding.order_index + 1)
+  const area = finding.area === "order" && finding.order_index !== null ? "Order " + (finding.order_index + 1)
     : finding.area.replace("_", " ");
   const label = decision
     ? "✓ " + decision.action[0].toUpperCase() + decision.action.slice(1)
@@ -414,7 +476,8 @@ function findingEntry(finding, approved) {
   entry.append(summary);
   if (finding.chart_evidence) entry.append(create("p", "muted", "Chart · " + finding.chart_evidence));
   if (finding.question) entry.append(create("p", "", finding.question));
-  const quoted = finding.evidence.length ? finding.evidence : (!approved && finding.order_index !== null
+  const quoted = finding.evidence.length ? finding.evidence : (!approved && finding.area === "order"
+    && finding.order_index !== null
     ? [visit.draft.staged_orders[finding.order_index]?.transcript_timestamp_reference].filter(Boolean)
     : []);
   appendEvidence(entry, quoted);
@@ -425,10 +488,12 @@ function findingEntry(finding, approved) {
       event.preventDefault();
       event.stopPropagation();
       resolutions.delete(finding.id);
-      if (finding.severity === "blocking" && finding.order_index !== null) {
+      if (finding.area === "order" && finding.order_index !== null
+        && (finding.severity === "blocking" || decision.action === "dropped")) {
         decisions[finding.order_index] = null;
         for (const other of visit.verification.findings) {
-          if (other.order_index === finding.order_index && other.severity === "blocking") {
+          if (other.order_index === finding.order_index
+            && resolutions.get(other.id)?.action === "dropped") {
             resolutions.delete(other.id);
           }
         }
@@ -488,11 +553,21 @@ function renderVerification() {
   metrics.textContent = "";
   byId("verification-steps").open = verifying;
   const reconciliation = prescriptionReconciliation(report);
-  for (const direction of reconciliation.directions) {
+  for (const direction of reconciliation.marks) {
     const editor = direction.area === "plan" ? editors.get("plan") : byId("summary");
-    const warning = create("p", "soap-verification",
-      "⚑ Dropped prescription · edit or remove this instruction, then save & verify: " + direction.text);
-    warning.dataset.state = "blocking";
+    const dismissed = findingDecision(direction);
+    const warning = create("div", "soap-verification",
+      (dismissed ? "Dismissed as not a direction · " : "⚑ Dropped prescription · ") + direction.text);
+    if (!dismissed) warning.dataset.state = "blocking";
+    warning.append(makeButton("resolution-undo", dismissed ? "Undo" : "Not a direction", () => {
+      if (dismissed) {
+        resolutions.delete(direction.id);
+        renderVerification();
+        updateApproval();
+      } else {
+        setResolution(direction, "not_a_direction");
+      }
+    }));
     editor.after(warning);
   }
   if (!report || verifying) {
@@ -505,7 +580,8 @@ function renderVerification() {
   const open = approved ? [] : openFindings(report);
   status.textContent = open.length
     ? open.length + (open.length === 1 ? " item needs your decision" : " items need your decision")
-    : reconciliation.directions.length || reconciliation.recheck ? "Review instructions for dropped prescriptions"
+    : reconciliation.directions.length || reconciliation.recheck || reconciliation.keptWithheld
+      ? "Review instructions for dropped prescriptions"
       : approved ? "Verification and decisions saved" : "Verified · ready to approve";
   metrics.textContent = report.findings.filter(item => item.kind !== "medication_safety").length
     + " lines and orders checked · " + report.prescription_count + " prescriptions"
@@ -513,7 +589,7 @@ function renderVerification() {
   const corrections = report.corrections || [];
   for (const [severity, amount, text] of [
     ["blocking", open.filter(item => item.severity === "blocking").length
-      + Number(reconciliation.directions.length > 0 || reconciliation.recheck), "blocking"],
+      + Number(reconciliation.directions.length > 0 || reconciliation.recheck || reconciliation.keptWithheld), "blocking"],
     ["question", open.filter(item => item.severity === "question").length, "questions"],
     ["info", corrections.length, "fixed"], ["info", supported.length, "supported"],
   ]) {
@@ -524,8 +600,14 @@ function renderVerification() {
   if (open.length) findings.append(create("h3", "verification-group", "Needs your decision"));
   for (const finding of [...open].sort((a, b) => Number(b.severity === "blocking")
     - Number(a.severity === "blocking"))) findings.append(findingEntry(finding, approved));
-  if (resolved.length) findings.append(create("h3", "verification-group", "Resolved"));
+  const dismissedMarks = approved ? (report.prescription_directions || []).filter(item => findingDecision(item)) : [];
+  if (resolved.length || dismissedMarks.length) findings.append(create("h3", "verification-group", "Resolved"));
   for (const finding of resolved) findings.append(findingEntry(finding, approved));
+  for (const mark of dismissedMarks) {
+    const decision = findingDecision(mark);
+    findings.append(create("p", "resolution-status",
+      "Not a direction · " + mark.text + " · " + decision.reviewer));
+  }
   if (corrections.length) findings.append(create("h3", "verification-group", "Fixed automatically"));
   for (const correction of corrections) {
     const entry = create("details", "verification-check");
@@ -778,7 +860,7 @@ function clearAudio() {
   selection = null;
   byId("file").value = "";
   byId("elapsed").textContent = "00:00";
-  byId("audio-name").textContent = "MP3, M4A, WAV or WebM · up to 25 MB";
+  byId("audio-name").textContent = audioLabel();
 }
 
 function selectAudio(file) {
@@ -786,7 +868,7 @@ function selectAudio(file) {
   const extension = file.name.split(".").at(-1).toLowerCase();
   if (!audioFormats.has(extension) || !file.size || file.size > maxAudioBytes) {
     byId("file").value = "";
-    say("Choose a supported audio file up to 25 MB.", true);
+    say("Choose a supported audio file up to " + audioLimit() + ".", true);
     return;
   }
   selection = file;
@@ -839,7 +921,7 @@ byId("record").addEventListener("click", () => work(async () => {
       clearInterval(recordingTimer);
       recorder = null;
       if (size > maxAudioBytes) {
-        say("The recording exceeded 25 MB. Record a shorter visit or choose a smaller file.", true);
+        say("The recording exceeded " + audioLimit() + ". Choose a shorter recording.", true);
       } else if (!failed && chunks.length) {
         const extension = { "audio/webm": "webm", "audio/mp4": "m4a", "audio/ogg": "ogg" }[type.split(";")[0]];
         selection = new File(chunks, "Microphone recording." + extension, { type });
@@ -876,6 +958,27 @@ function setProgress(step, message) {
   updateControls();
 }
 
+async function submitRecording(file, extension) {
+  const headers = { "X-Audio-Format": extension, "Content-Type": "application/octet-stream" };
+  const path = visitPath("/recording");
+  if (audioChunkBytes && file.size > audioChunkBytes) {
+    const uploadId = crypto.randomUUID();
+    const parts = Math.ceil(file.size / audioChunkBytes);
+    const query = "upload_id=" + uploadId;
+    for (let part = 0; part < parts; part++) {
+      setProgress(0, `Uploading recording (${part + 1} of ${parts})…`);
+      const offset = part * audioChunkBytes;
+      await api(`${path}/chunks/${part}?${query}&total_bytes=${file.size}`, {
+        method: "PUT", headers, body: file.slice(offset, offset + audioChunkBytes),
+      });
+    }
+    setProgress(0, "Transcribing the recording…");
+    return api(`${path}/chunks/complete?${query}`, { method: "POST", headers });
+  }
+  setProgress(0, "Transcribing the recording…");
+  return api(path, { method: "PUT", headers, body: file });
+}
+
 async function generateDraft() {
   setProgress(2, "Drafting SOAP note, patient instructions, and orders…");
   showVisit(await api(visitPath("/draft"), { method: "POST" }));
@@ -889,6 +992,7 @@ async function verifyCurrentDraft(repair = false) {
     const options = json("POST", {
       revision: visit.draft.updated_at,
       repair,
+      dropped_prescriptions: droppedPrescriptions(),
     });
     const response = await fetch(visitPath("/verify"), {
       ...options,
@@ -920,7 +1024,10 @@ async function verifyCurrentDraft(repair = false) {
       await reader.cancel();
     }
     if (!checked) throw new Error("Verification did not finish.");
-    resolutions.clear();
+    const checkedMarks = new Set(checked.verification?.prescription_directions?.map(item => item.id));
+    for (const [id, decision] of resolutions) {
+      if (decision.action !== "not_a_direction" || !checkedMarks.has(id)) resolutions.delete(id);
+    }
     showVisit(checked);
   } finally {
     verifying = false;
@@ -935,22 +1042,31 @@ byId("transcribe").addEventListener("click", () => work(async () => {
   if (!selection || recorder) return;
   const label = requireLabel();
   if (!visit) {
+    const patientId = byId("patient-chart").value;
+    const patientName = byId("patient-name").value.trim();
+    if (isReturningPatient() && !patientId) {
+      byId("patient-chart").focus();
+      throw new Error("Choose the returning patient’s saved chart.");
+    }
+    if (!isReturningPatient() && !patientName) {
+      byId("patient-name").focus();
+      throw new Error("Enter the new patient’s name.");
+    }
     visit = await api("/api/visits", json("POST", {
       label,
-      allergies: chartLines("chart-allergies").map(allergen => ({ allergen })),
-      current_medications: chartLines("chart-medications").map(name => ({ name })),
+      ...(isReturningPatient() ? { patient_id: patientId } : {
+        patient_name: patientName,
+        allergies: chartLines("chart-allergies").map(allergen => ({ allergen })),
+        current_medications: chartLines("chart-medications").map(name => ({ name })),
+      }),
     }));
+    updatePatientSelection();
     history.replaceState(null, "", pagePath(visit.id, "capture"));
     visits.unshift(visit);
     renderVisitList();
   }
   const extension = selection.name.split(".").at(-1).toLowerCase();
-  setProgress(0, "Transcribing the recording…");
-  const data = await api(visitPath("/recording"), {
-    method: "PUT",
-    headers: { "X-Audio-Format": extension, "Content-Type": "application/octet-stream" },
-    body: selection,
-  });
+  const data = await submitRecording(selection, extension);
   clearAudio();
   showVisit(data);
   await generateDraft();
@@ -975,7 +1091,9 @@ async function saveReview(approve, reverify = true) {
     visit_summary_for_patient: byId("summary").value,
     clinician: approve ? byId("clinician").value.trim() : null,
     kept_orders: kept,
-    resolutions: approve ? [...resolutions.values()] : [],
+    resolutions: approve ? [...resolutions.values()].filter(resolution =>
+      resolution.action !== "not_a_direction" || prescriptionReconciliation(currentVerification())
+        .marks.some(mark => mark.id === resolution.finding_id)) : [],
     text_on_approval_to: approve && byId("text-on-approval").checked
       ? normalizedPhone("approval-phone") : null,
   };
@@ -999,10 +1117,26 @@ async function saveReview(approve, reverify = true) {
 }
 
 byId("review").addEventListener("input", event => {
+  if (event.target.closest("#save-allergy")) return;
   dirty = true;
   if (event.target.id !== "summary" && !fields.includes(event.target.id)) return;
   renderVerification();
   updateApproval();
+});
+byId("save-allergy").addEventListener("submit", event => {
+  event.preventDefault();
+  const allergen = byId("allergen-name").value.trim();
+  const reaction = byId("allergy-reaction").value.trim() || null;
+  if (!allergen || !validateReview()) return;
+  work(async () => {
+    if (!matchesSavedDraft()) await saveReview(false, false);
+    const updated = await api(visitPath("/allergies"), json("POST", { allergen, reaction }));
+    byId("save-allergy").reset();
+    resolutions.clear();
+    showVisit(updated);
+    if (!updated.verification) await verifyCurrentDraft();
+    say("Allergy saved to the patient chart.");
+  });
 });
 byId("clinician").addEventListener("input", updateApproval);
 byId("text-on-approval").addEventListener("change", updateApproval);
@@ -1083,6 +1217,13 @@ byId("sms-form").addEventListener("submit", (event) => {
 });
 
 work(async () => {
+  const config = await api("/api/visits/config");
+  maxAudioBytes = config.max_audio_bytes;
+  audioChunkBytes = config.audio_chunk_bytes;
+  byId("audio-name").textContent = audioLabel();
+  byId("demo-notice").hidden = !config.hosted_demo;
+  byId("sms-form").hidden = config.hosted_demo;
+  byId("text-on-approval-option").hidden = config.hosted_demo;
   const path = /^\/visits\/([^/]+)\/(capture|review|approved)$/.exec(location.pathname);
   if (path) showVisit(await api("/api/visits/" + path[1]), true, path[2]);
   visits = await api("/api/visits");

@@ -32,6 +32,7 @@
         <span aria-hidden="true" class="slash">/</span>
         <h1 id="visit-title" tabindex="-1">New visit</h1>
         <span id="visit-status" class="badge" hidden></span>
+        <a id="previous-visit" class="previous-visit" hidden>Prior visit on this chart</a>
       </div>
       <ol id="steps" class="steps" aria-label="Visit progress">
         <li aria-current="step"><span aria-hidden="true">1</span> Capture</li>
@@ -42,11 +43,26 @@
       <button id="back-approved" type="button" hidden>Copy note &amp; text patient</button>
     </header>
     <p id="status" class="status" role="status" aria-live="polite"></p>
+    <p id="demo-notice" class="status" hidden>Hackathon demo. Use fictional patient details and audio.</p>
 
     <section id="capture" class="capture" aria-label="Capture visit">
+      <fieldset id="patient-mode" class="patient-mode">
+        <legend class="field-label">Patient chart</legend>
+        <label><input type="radio" name="patient-mode" value="new" checked> New patient</label>
+        <label><input type="radio" name="patient-mode" value="returning"> Returning patient</label>
+      </fieldset>
+      <div id="new-patient-fields" class="patient-fields">
+        <label class="field-label" for="patient-name">Patient name</label>
+        <input id="patient-name" maxlength="120" autocomplete="off" placeholder="e.g. Morgan Rivera">
+      </div>
+      <div id="returning-patient-fields" class="patient-fields" hidden>
+        <label class="field-label" for="patient-chart">Saved patient chart</label>
+        <select id="patient-chart" aria-describedby="returning-allergies"></select>
+        <p id="returning-allergies" class="muted"></p>
+      </div>
       <label for="visit-label" class="eyebrow">Visit label</label>
       <input id="visit-label" class="visit-label" maxlength="120" placeholder="e.g. Follow-up · Persistent cough">
-      <details class="chart-inputs">
+      <details id="capture-chart-inputs" class="chart-inputs">
         <summary>Medication safety context</summary>
         <label class="field-label" for="chart-allergies">Documented allergies</label>
         <textarea id="chart-allergies" rows="2" maxlength="5000" placeholder="One allergen per line"></textarea>
@@ -115,6 +131,20 @@
         </section>
       </div>
       <div class="order-stack">
+        <section class="glass" aria-labelledby="chart-title">
+          <header class="card-header"><h2 id="chart-title">Chart allergies</h2></header>
+          <div class="card-content">
+            <p id="review-patient" class="muted"></p>
+            <ul id="saved-allergies" class="saved-allergies"></ul>
+            <form id="save-allergy" class="allergy-form">
+              <label class="field-label" for="allergen-name">Allergen</label>
+              <input id="allergen-name" maxlength="200" required placeholder="e.g. amlodipine">
+              <label class="field-label" for="allergy-reaction">Reaction</label>
+              <input id="allergy-reaction" maxlength="200" placeholder="e.g. hives">
+              <button type="submit">Save allergy to chart</button>
+            </form>
+          </div>
+        </section>
         <section class="glass" aria-labelledby="orders-title">
           <header class="card-header"><h2 id="orders-title">Proposed orders</h2><span id="order-count" class="order-count"></span></header>
           <div id="orders" class="orders"></div>
@@ -133,7 +163,7 @@
           <h2>Approve visit</h2>
           <label class="field-label" for="clinician">Reviewer name</label>
           <input id="clinician" maxlength="64" required autocomplete="name" placeholder="e.g. Dr. A. Rivera">
-          <label class="text-on-approval"><input id="text-on-approval" type="checkbox"> Text patient instructions on approval</label>
+          <label id="text-on-approval-option" class="text-on-approval"><input id="text-on-approval" type="checkbox"> Text patient instructions on approval</label>
           <div id="approval-recipient" hidden>
             <label class="field-label" for="approval-phone">Patient phone number</label>
             <input id="approval-phone" type="tel" maxlength="32" placeholder="+1 (555) 010-0000" autocomplete="tel" disabled>

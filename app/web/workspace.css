@@ -146,6 +146,7 @@ body:not([data-screen="capture"]) .sidebar, body[data-screen="capture"] .small-m
 .breadcrumb, .steps, .actions { display: flex; align-items: center; flex-wrap: wrap; gap: .6rem; min-width: 0; }
 .breadcrumb { gap: .85rem; }
 .breadcrumb h1 { font-size: 1.45rem; font-weight: 660; letter-spacing: -.025em; overflow-wrap: anywhere; }
+.previous-visit { color: var(--mint); font-size: .8rem; text-underline-offset: .18em; }
 body[data-screen="capture"] .topbar { min-height: 66px; }
 body[data-screen="capture"] .breadcrumb h1 { font-size: .94rem; }
 .slash { color: var(--muted); }
@@ -187,6 +188,15 @@ body[data-screen="capture"] .breadcrumb h1 { font-size: .94rem; }
 .chart-inputs summary { cursor: pointer; color: var(--muted); }
 .chart-inputs textarea { margin: .25rem 0 .6rem; }
 .chart-inputs .field-label { margin-top: .55rem; }
+.patient-mode { border: 0; padding: 0; margin: 0 0 1rem; }
+.patient-mode label { display: inline-flex; align-items: center; gap: .4rem; margin: .4rem 1rem 0 0; }
+.patient-mode input { width: auto; accent-color: var(--mint); }
+.patient-fields { margin-bottom: 1rem; }
+.patient-fields input, .patient-fields select { width: 100%; margin-top: .3rem; }
+#returning-allergies { margin-top: .45rem; }
+.saved-allergies { padding-inline-start: 1.15rem; margin: .45rem 0; }
+.allergy-form .field-label { margin-top: .6rem; }
+.allergy-form button { margin-top: .7rem; }
 .verification-trace { padding-left: 1.2rem; margin: .55rem 0; font-size: .84rem; color: var(--muted); }
 .verification-trace:empty { display: none; }
 .verification-check { border-top: 1px solid var(--line); margin-top: .45rem; padding-top: .45rem; font-size: .86rem; }

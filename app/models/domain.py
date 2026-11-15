@@ -20,6 +20,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Index,
+    LargeBinary,
     String,
     Text,
     Uuid,
@@ -176,9 +177,23 @@ class Encounter(TimestampMixin, Base):
         passive_deletes=True,
         order_by="ClinicalDocument.created_at",
     )
+    workspace_details: Mapped[WorkspaceVisitDetails | None] = relationship(
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
     def __repr__(self) -> str:
         return f"<Encounter id={self.id} status={self.status}>"
+
+
+class WorkspaceVisitDetails(Base):
+    __tablename__ = "workspace_visit_details"
+
+    encounter_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("encounters.id", ondelete="CASCADE"), primary_key=True
+    )
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    language: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
 
 
 class RecordingTimeline(Base):
@@ -190,6 +205,21 @@ class RecordingTimeline(Base):
         ForeignKey("encounters.id", ondelete="CASCADE"), primary_key=True
     )
     segments: Mapped[list[dict[str, Any]]] = mapped_column(JSONType, nullable=False)
+
+
+class RecordingUploadChunk(Base):
+    """Temporary recording bytes for one in-progress upload per encounter."""
+
+    __tablename__ = "recording_upload_chunks"
+
+    encounter_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("encounters.id", ondelete="CASCADE"), primary_key=True
+    )
+    part: Mapped[int] = mapped_column(primary_key=True)
+    upload_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    total_bytes: Mapped[int] = mapped_column(nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    audio: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
 
 class IntakeChat(Base):

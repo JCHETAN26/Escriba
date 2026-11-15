@@ -1,4 +1,4 @@
-"""Single-user, loopback visit capture and chart review workspace."""
+"""Visit capture and chart review for the local workspace and hosted demo."""
 
 from __future__ import annotations
 
@@ -7,15 +7,15 @@ import json
 import re
 import uuid
 from collections.abc import AsyncIterator, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from openai import APIStatusError, AsyncOpenAI, OpenAIError, RateLimitError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import selectinload
 
@@ -31,6 +31,8 @@ from app.models.domain import (
     EncounterStatus,
     Patient,
     RecordingTimeline,
+    RecordingUploadChunk,
+    WorkspaceVisitDetails,
     utcnow,
 )
 from app.routers.encounter import (
@@ -44,8 +46,10 @@ from app.schemas.clinical import (
     Medication,
     SOAPNote,
     StagedOrder,
+    dedupe_allergies,
 )
 from app.services.draft_verification import (
+    VERIFICATION_VERSION,
     Finding,
     FindingResolution,
     ResolutionAudit,
@@ -71,6 +75,10 @@ from app.services.visit_language import (
 
 ASSETS = Path(__file__).resolve().parents[1] / "web"
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+HOSTED_REQUEST_BYTES = 4_000_000
+AUDIO_CHUNK_BYTES = 3_000_000
+AUDIO_UPLOAD_TTL = timedelta(hours=1)
+DEMO_COOKIE = "__Host-escriba-demo"
 LOCKED_VISIT = "This visit is approved and locked."
 STALE_DRAFT = "This draft changed. Reopen the visit."
 PhoneNumber = Annotated[str, Field(pattern=r"^\+[1-9][0-9]{7,14}$")]
@@ -98,24 +106,45 @@ OBJECTIVE_TESTING_ABSENCE = re.compile(
 )
 
 
-def require_local_workspace(request: Request, settings: SettingsDep) -> None:
-    if (
+def require_workspace(
+    request: Request, response: Response, settings: SettingsDep, session: DbSession
+) -> None:
+    if settings.hosted_demo:
+        public_url = settings.public_base_url
+        if public_url is None or request.url.hostname != public_url.host:
+            raise HTTPException(status_code=404, detail="Open the published demo URL.")
+        expected_origin = str(public_url).rstrip("/")
+    elif (
         settings.environment != "development"
         or request.client is None
         or request.client.host not in LOCAL_HOSTS
         or request.url.hostname not in LOCAL_HOSTS
     ):
         raise HTTPException(status_code=404, detail="Workspace is only available locally.")
+    else:
+        expected_origin = str(request.base_url).rstrip("/")
     if request.method != "GET":
         origin = request.headers.get("origin")
         if request.headers.get("x-escriba-workspace") != "1" or (
-            origin is not None and origin != str(request.base_url).rstrip("/")
+            origin is not None and origin != expected_origin
         ):
             raise HTTPException(status_code=403, detail="Open the Escriba workspace to continue.")
+    if settings.hosted_demo:
+        token = request.cookies.get(DEMO_COOKIE, "")
+        if not re.fullmatch(r"[a-f0-9]{32}", token):
+            token = uuid.uuid4().hex
+            response.set_cookie(
+                DEMO_COOKIE, token, secure=True, httponly=True, samesite="lax", max_age=86_400
+            )
+        session.info["workspace_provider"] = f"demo-{token}"
+
+
+def _workspace_provider(session: DbSession) -> str:
+    return str(session.info.get("workspace_provider", WORKSPACE_PROVIDER_ID))
 
 
 router = APIRouter(
-    dependencies=[Depends(require_local_workspace)],
+    dependencies=[Depends(require_workspace)],
     tags=["workspace"],
 )
 
@@ -126,6 +155,15 @@ class VisitLabel(BaseModel):
     preferred_language: SummaryLanguage | None = None
     allergies: list[Allergy] = Field(default_factory=list, max_length=30)
     current_medications: list[Medication] = Field(default_factory=list, max_length=50)
+    patient_id: uuid.UUID | None = None
+    patient_name: str | None = Field(default=None, min_length=1, max_length=120)
+
+
+class PatientChartOption(BaseModel):
+    id: uuid.UUID
+    label: str
+    last_visit_at: datetime
+    allergies: tuple[Allergy, ...]
 
 
 class VisitListItem(BaseModel):
@@ -136,6 +174,8 @@ class VisitListItem(BaseModel):
 
 
 class VisitView(VisitListItem):
+    patient_id: uuid.UUID
+    patient_name: str
     transcript: str | None
     transcript_segments: list[TranscriptSegment] = Field(default_factory=list)
     draft: SynthesizeResponse | None
@@ -151,6 +191,7 @@ class VisitView(VisitListItem):
     verification: VerificationReport | None = None
     allergies: tuple[Allergy, ...] = ()
     current_medications: tuple[Medication, ...] = ()
+    previous_visit: VisitListItem | None = None
 
 
 class Review(BaseModel):
@@ -185,6 +226,7 @@ class SummaryTextReceipt(BaseModel):
 class VerifyDraftRequest(BaseModel):
     revision: datetime
     repair: bool = False
+    dropped_prescriptions: set[int] = Field(default_factory=set, max_length=100)
 
 
 class ChangeLanguageRequest(BaseModel):
@@ -235,12 +277,17 @@ async def workspace_asset(asset: str) -> FileResponse:
     return FileResponse(ASSETS / asset)
 
 
-async def _load_visit(session: DbSession, visit_id: uuid.UUID) -> Encounter:
-    visit = await session.scalar(
+async def _load_visit(session: DbSession, visit_id: uuid.UUID, *, lock: bool = False) -> Encounter:
+    query = (
         select(Encounter)
-        .options(selectinload(Encounter.patient), selectinload(Encounter.clinical_documents))
-        .where(Encounter.id == visit_id, Encounter.provider_id == WORKSPACE_PROVIDER_ID)
+        .options(
+            selectinload(Encounter.patient),
+            selectinload(Encounter.clinical_documents),
+            selectinload(Encounter.workspace_details),
+        )
+        .where(Encounter.id == visit_id, Encounter.provider_id == _workspace_provider(session))
     )
+    visit = await session.scalar(query.with_for_update() if lock else query)
     if visit is None:
         raise HTTPException(status_code=404, detail="Visit not found.")
     return visit
@@ -249,10 +296,16 @@ async def _load_visit(session: DbSession, visit_id: uuid.UUID) -> Encounter:
 def _item(visit: Encounter) -> VisitListItem:
     return VisitListItem(
         id=visit.id,
-        label=str(visit.patient.demographics["label"]),
+        label=visit.workspace_details.label
+        if visit.workspace_details
+        else _patient_label(visit.patient),
         created_at=visit.created_at,
         status=visit.status,
     )
+
+
+def _patient_label(patient: Patient) -> str:
+    return str(patient.demographics.get("label") or "Unnamed patient")
 
 
 async def _view(visit: Encounter, session: DbSession) -> VisitView:
@@ -264,8 +317,23 @@ async def _view(visit: Encounter, session: DbSession) -> VisitView:
         draft = SynthesizeResponse.from_document_and_synthesis(doc, _synthesis(doc))
         verification = await _verification(doc, session)
     chart = PatientContext.from_patient(visit.patient)
+    previous = await session.scalar(
+        select(Encounter)
+        .options(selectinload(Encounter.patient), selectinload(Encounter.workspace_details))
+        .where(
+            Encounter.patient_id == visit.patient_id,
+            Encounter.provider_id == visit.provider_id,
+            Encounter.created_at < visit.created_at,
+            Encounter.status == EncounterStatus.COMPLETED,
+            Encounter.clinical_documents.any(ClinicalDocument.status == DocumentStatus.APPROVED),
+        )
+        .order_by(Encounter.created_at.desc())
+        .limit(1)
+    )
     return VisitView(
         **_item(visit).model_dump(),
+        patient_id=visit.patient_id,
+        patient_name=_patient_label(visit.patient),
         transcript=visit.transcript,
         transcript_segments=[
             TranscriptSegment.model_validate(segment) for segment in timeline.segments
@@ -276,13 +344,14 @@ async def _view(visit: Encounter, session: DbSession) -> VisitView:
         approved_by=doc.approved_by if doc else None,
         approved_at=doc.approved_at if doc else None,
         preferred_language=_preferred_language(visit),
-        detected_language=visit.patient.demographics.get("detected_language"),
-        detection_confidence=visit.patient.demographics.get("detection_confidence"),
+        detected_language=_visit_language(visit).get("detected_language"),
+        detection_confidence=_visit_language(visit).get("detection_confidence"),
         note_language=_note_language(visit),
         patient_language=_preferred_language(visit),
         verification=verification,
         allergies=chart.allergies,
         current_medications=chart.medications,
+        previous_visit=_item(previous) if previous is not None else None,
     )
 
 
@@ -300,7 +369,11 @@ def _revision(value: datetime) -> str:
 
 async def _verification(doc: ClinicalDocument, session: DbSession) -> VerificationReport | None:
     saved = await session.get(DraftVerification, doc.id)
-    if saved and saved.report.get("version") != 2 and doc.status != DocumentStatus.APPROVED:
+    if (
+        saved
+        and saved.report.get("version") != VERIFICATION_VERSION
+        and doc.status != DocumentStatus.APPROVED
+    ):
         return None
     if saved and (
         saved.revision == _revision(doc.updated_at) or doc.status == DocumentStatus.APPROVED
@@ -309,17 +382,30 @@ async def _verification(doc: ClinicalDocument, session: DbSession) -> Verificati
     return None
 
 
+def _visit_language(visit: Encounter) -> dict[str, object]:
+    if visit.workspace_details is not None:
+        return visit.workspace_details.language
+    return visit.patient.demographics
+
+
 def _preferred_language(visit: Encounter) -> SummaryLanguage:
-    demographics = visit.patient.demographics
+    language = _visit_language(visit)
     return (
         "es"
-        if demographics.get("patient_language", demographics.get("preferred_language")) == ("es")
+        if language.get("patient_language", language.get("preferred_language")) == "es"
         else "en"
     )
 
 
 def _note_language(visit: Encounter) -> SummaryLanguage:
-    return "es" if visit.patient.demographics.get("note_language") == "es" else "en"
+    return "es" if _visit_language(visit).get("note_language") == "es" else "en"
+
+
+def _save_visit_language(visit: Encounter, **values: object) -> None:
+    updated = {**_visit_language(visit), **values}
+    if visit.workspace_details is None:
+        visit.workspace_details = WorkspaceVisitDetails(label=_patient_label(visit.patient))
+    visit.workspace_details.language = updated
 
 
 def _client(request: Request) -> AsyncOpenAI:
@@ -341,24 +427,85 @@ async def list_visits(session: DbSession, response: Response) -> list[VisitListI
     _no_store(response)
     visits = await session.scalars(
         select(Encounter)
-        .options(selectinload(Encounter.patient))
-        .where(Encounter.provider_id == WORKSPACE_PROVIDER_ID)
+        .options(selectinload(Encounter.patient), selectinload(Encounter.workspace_details))
+        .where(Encounter.provider_id == _workspace_provider(session))
         .order_by(Encounter.created_at.desc())
         .limit(100)
     )
     return [_item(visit) for visit in visits]
 
 
+@router.get("/api/visits/config")
+async def workspace_config(settings: SettingsDep, response: Response) -> dict[str, int | bool]:
+    _no_store(response)
+    return {
+        "hosted_demo": settings.hosted_demo,
+        "max_audio_bytes": MAX_AUDIO_BYTES,
+        "audio_chunk_bytes": AUDIO_CHUNK_BYTES if settings.hosted_demo else 0,
+    }
+
+
+@router.get("/api/patients", response_model=list[PatientChartOption])
+async def list_patient_charts(session: DbSession, response: Response) -> list[PatientChartOption]:
+    _no_store(response)
+    latest = (
+        select(Encounter.patient_id, func.max(Encounter.created_at).label("last_visit_at"))
+        .where(Encounter.provider_id == _workspace_provider(session))
+        .group_by(Encounter.patient_id)
+        .subquery()
+    )
+    rows = await session.execute(
+        select(Patient, latest.c.last_visit_at)
+        .join(latest, latest.c.patient_id == Patient.id)
+        .order_by(latest.c.last_visit_at.desc(), Patient.id)
+    )
+    return [
+        PatientChartOption(
+            id=patient.id,
+            label=_patient_label(patient),
+            last_visit_at=last_visit,
+            allergies=PatientContext.from_patient(patient).allergies,
+        )
+        for patient, last_visit in rows
+    ]
+
+
 @router.post("/api/visits", response_model=VisitView, status_code=201)
 async def create_visit(body: VisitLabel, session: DbSession, response: Response) -> VisitView:
     _no_store(response)
-    visit = Encounter(
-        patient=Patient(
-            demographics={"label": body.label, "preferred_language": body.preferred_language},
+    if body.patient_id is None:
+        patient = Patient(
+            demographics={
+                "label": body.patient_name or body.label,
+                "preferred_language": body.preferred_language,
+            },
             allergies=[allergy.model_dump() for allergy in body.allergies],
             active_medications=[medication.model_dump() for medication in body.current_medications],
+        )
+    else:
+        if body.patient_name or body.allergies or body.current_medications:
+            raise HTTPException(
+                status_code=422, detail="Use the saved chart for a returning patient."
+            )
+        existing = await session.scalar(
+            select(Patient).where(
+                Patient.id == body.patient_id,
+                Patient.encounters.any(Encounter.provider_id == _workspace_provider(session)),
+            )
+        )
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Patient chart not found.")
+        patient = existing
+    visit = Encounter(
+        patient=patient,
+        workspace_details=WorkspaceVisitDetails(
+            label=body.label,
+            language={
+                "preferred_language": body.preferred_language
+                or patient.demographics.get("preferred_language"),
+            },
         ),
-        provider_id=WORKSPACE_PROVIDER_ID,
+        provider_id=_workspace_provider(session),
         scheduled_time=utcnow(),
         clinical_documents=[],
     )
@@ -367,10 +514,79 @@ async def create_visit(body: VisitLabel, session: DbSession, response: Response)
     return await _view(visit, session)
 
 
+@router.post("/api/visits/{visit_id}/allergies", response_model=VisitView)
+async def document_allergy(
+    visit_id: uuid.UUID, allergy: Allergy, session: DbSession, response: Response
+) -> VisitView:
+    _no_store(response)
+    visit = await _load_visit(session, visit_id)
+    doc = next(iter(visit.clinical_documents), None)
+    if doc is None or doc.status != DocumentStatus.REVIEW_PENDING:
+        raise HTTPException(
+            status_code=409, detail="Open an editable draft to document an allergy."
+        )
+    patient = visit.patient
+    existing = PatientContext.from_patient(patient).allergies
+    for recorded in existing:
+        if (
+            recorded.allergen.casefold() == allergy.allergen.casefold()
+            and recorded.reaction
+            and allergy.reaction
+            and recorded.reaction.casefold() != allergy.reaction.casefold()
+        ):
+            raise HTTPException(status_code=409, detail="A different reaction is already on file.")
+    merged = dedupe_allergies([*existing, allergy])
+    if merged != list(existing):
+        patient_change = await session.execute(
+            update(Patient)
+            .where(Patient.id == patient.id, Patient.updated_at == patient.updated_at)
+            .values(allergies=[item.model_dump() for item in merged], updated_at=utcnow())
+        )
+        _require_change(patient_change)
+        # A saved verification used the old chart. Invalidate all pending notes for this chart.
+        await session.execute(
+            update(ClinicalDocument)
+            .where(
+                ClinicalDocument.encounter_id.in_(
+                    select(Encounter.id).where(Encounter.patient_id == patient.id)
+                ),
+                ClinicalDocument.status == DocumentStatus.REVIEW_PENDING,
+            )
+            .values(updated_at=utcnow())
+            .execution_options(synchronize_session="fetch")
+        )
+        await session.commit()
+        await session.refresh(patient)
+    return await _view(visit, session)
+
+
 @router.get("/api/visits/{visit_id}", response_model=VisitView)
 async def get_visit(visit_id: uuid.UUID, session: DbSession, response: Response) -> VisitView:
     _no_store(response)
     return await _view(await _load_visit(session, visit_id), session)
+
+
+def _require_unrecorded(visit: Encounter) -> None:
+    if visit.transcript or visit.status != EncounterStatus.SCHEDULED:
+        raise HTTPException(status_code=409, detail="This visit already has a recording.")
+
+
+def _audio_extension(request: Request) -> str:
+    extension = request.headers.get("x-audio-format", "").lower()
+    if extension not in AUDIO_FORMATS:
+        raise HTTPException(status_code=415, detail="Choose a supported audio file.")
+    return extension
+
+
+async def _read_audio(request: Request, limit: int, limit_message: str) -> bytes:
+    audio = bytearray()
+    async for chunk in request.stream():
+        if len(audio) + len(chunk) > limit:
+            raise HTTPException(status_code=413, detail=limit_message)
+        audio.extend(chunk)
+    if not audio:
+        raise HTTPException(status_code=400, detail="The recording is empty.")
+    return bytes(audio)
 
 
 @router.put("/api/visits/{visit_id}/recording", response_model=VisitView)
@@ -384,20 +600,136 @@ async def upload_recording(
     _no_store(response)
     client = _client(request)
     visit = await _load_visit(session, visit_id)
-    if visit.transcript or visit.status != EncounterStatus.SCHEDULED:
-        raise HTTPException(status_code=409, detail="This visit already has a recording.")
-    extension = request.headers.get("x-audio-format", "").lower()
-    if extension not in AUDIO_FORMATS:
-        raise HTTPException(status_code=415, detail="Choose a supported audio file.")
-    audio = bytearray()
-    async for chunk in request.stream():
-        if len(audio) + len(chunk) > MAX_AUDIO_BYTES:
-            raise HTTPException(status_code=413, detail="Audio files must be 25 MB or less.")
-        audio.extend(chunk)
-    if not audio:
-        raise HTTPException(status_code=400, detail="The recording is empty.")
+    _require_unrecorded(visit)
+    extension = _audio_extension(request)
+    limit = HOSTED_REQUEST_BYTES if settings.hosted_demo else MAX_AUDIO_BYTES
+    audio = await _read_audio(
+        request, limit, f"Single uploads are limited to {limit // 1_000_000} MB."
+    )
+    return await _transcribe_visit(session, settings, client, visit, audio, extension)
+
+
+@router.put("/api/visits/{visit_id}/recording/chunks/{part}")
+async def upload_recording_chunk(
+    visit_id: uuid.UUID,
+    part: int,
+    upload_id: uuid.UUID,
+    total_bytes: Annotated[int, Query(gt=0, le=MAX_AUDIO_BYTES)],
+    request: Request,
+    session: DbSession,
+    response: Response,
+) -> dict[str, int]:
+    _no_store(response)
+    expected = min(AUDIO_CHUNK_BYTES, total_bytes - part * AUDIO_CHUNK_BYTES)
+    if part < 0 or expected <= 0:
+        raise HTTPException(status_code=422, detail="Invalid recording part.")
+    audio = await _read_audio(request, expected, "Recording part is too large.")
+    if len(audio) != expected:
+        raise HTTPException(status_code=422, detail="Recording part is incomplete.")
+
+    visit = await _load_visit(session, visit_id, lock=True)
+    _require_unrecorded(visit)
+    now = utcnow()
+    # Leave expired uploads unavailable and reclaim their space on the next upload.
+    if part == 0:
+        await session.execute(
+            delete(RecordingUploadChunk).where(RecordingUploadChunk.expires_at <= now)
+        )
+    first = (
+        await session.execute(
+            select(
+                RecordingUploadChunk.upload_id,
+                RecordingUploadChunk.total_bytes,
+                RecordingUploadChunk.expires_at,
+            ).where(
+                RecordingUploadChunk.encounter_id == visit_id,
+                RecordingUploadChunk.part == 0,
+                RecordingUploadChunk.expires_at > now,
+            )
+        )
+    ).one_or_none()
+    if first is None or first.upload_id != upload_id:
+        if part != 0:
+            raise HTTPException(status_code=409, detail="Restart the recording upload.")
+        await session.execute(
+            delete(RecordingUploadChunk).where(RecordingUploadChunk.encounter_id == visit_id)
+        )
+        expires_at = now + AUDIO_UPLOAD_TTL
+    else:
+        if first.total_bytes != total_bytes:
+            raise HTTPException(
+                status_code=409, detail="Recording size changed. Restart the upload."
+            )
+        expires_at = first.expires_at
+        await session.execute(
+            delete(RecordingUploadChunk).where(
+                RecordingUploadChunk.encounter_id == visit_id, RecordingUploadChunk.part == part
+            )
+        )
+    session.add(
+        RecordingUploadChunk(
+            encounter_id=visit_id,
+            part=part,
+            upload_id=upload_id,
+            total_bytes=total_bytes,
+            expires_at=expires_at,
+            audio=audio,
+        )
+    )
+    await session.commit()
+    return {"part": part}
+
+
+@router.post("/api/visits/{visit_id}/recording/chunks/complete", response_model=VisitView)
+async def complete_recording_upload(
+    visit_id: uuid.UUID,
+    upload_id: uuid.UUID,
+    request: Request,
+    settings: SettingsDep,
+    session: DbSession,
+    response: Response,
+) -> VisitView:
+    _no_store(response)
+    extension = _audio_extension(request)
+    client = _client(request)
+    visit = await _load_visit(session, visit_id, lock=True)
+    _require_unrecorded(visit)
+    chunks = (
+        await session.scalars(
+            select(RecordingUploadChunk)
+            .where(
+                RecordingUploadChunk.encounter_id == visit_id,
+                RecordingUploadChunk.upload_id == upload_id,
+                RecordingUploadChunk.expires_at > utcnow(),
+            )
+            .order_by(RecordingUploadChunk.part)
+        )
+    ).all()
+    if not chunks or sum(len(chunk.audio) for chunk in chunks) != chunks[0].total_bytes:
+        raise HTTPException(status_code=409, detail="Recording upload is incomplete. Try again.")
+    audio = b"".join(chunk.audio for chunk in chunks)
+    await session.execute(
+        delete(RecordingUploadChunk).where(
+            RecordingUploadChunk.encounter_id == visit_id,
+            RecordingUploadChunk.upload_id == upload_id,
+        )
+    )
+    # Consume the upload once and release the database lock before calling OpenAI.
+    await session.commit()
+    return await _transcribe_visit(session, settings, client, visit, audio, extension)
+
+
+async def _transcribe_visit(
+    session: DbSession,
+    settings: SettingsDep,
+    client: AsyncOpenAI,
+    visit: Encounter,
+    audio: bytes,
+    extension: str,
+) -> VisitView:
+    visit_id = visit.id
     try:
-        recording = await transcribe_recording(client, settings, bytes(audio), extension)
+        recording = await transcribe_recording(client, settings, audio, extension)
     except RateLimitError as exc:
         raise HTTPException(status_code=429, detail="Transcription is busy. Try again.") from exc
     except APIStatusError as exc:
@@ -428,17 +760,20 @@ async def upload_recording(
         .values(transcript=recording.text, status=EncounterStatus.IN_PROGRESS)
     )
     _require_change(result)
-    demographics = visit.patient.demographics
-    patient_language = demographics.get("preferred_language") or (
+    if settings.hosted_demo:
+        await session.execute(
+            delete(RecordingUploadChunk).where(RecordingUploadChunk.encounter_id == visit_id)
+        )
+    patient_language = _visit_language(visit).get("preferred_language") or (
         "en" if detected == "en" else "es"
     )
-    visit.patient.demographics = {
-        **demographics,
-        "detected_language": detected,
-        "detection_confidence": confidence,
-        "note_language": settings.spanish_visits_note_language if detected == "es" else "en",
-        "patient_language": patient_language,
-    }
+    _save_visit_language(
+        visit,
+        detected_language=detected,
+        detection_confidence=confidence,
+        note_language=settings.spanish_visits_note_language if detected == "es" else "en",
+        patient_language=patient_language,
+    )
     if recording.segments:
         session.add(
             RecordingTimeline(
@@ -472,7 +807,7 @@ async def create_draft(
         summary_language=_preferred_language(visit),
         note_language=_note_language(visit),
     )
-    if visit.patient.demographics.get("detected_language") == "mixed":
+    if _visit_language(visit).get("detected_language") == "mixed":
         try:
             synthesis = await localize_draft(
                 _client(request),
@@ -538,6 +873,7 @@ async def verify_visit(
             async def run() -> VisitView:
                 try:
                     async with request.app.state.sessionmaker() as stream_session:
+                        stream_session.info.update(session.info)
                         return await _verify_visit(
                             visit_id, body, request, settings, stream_session, events.put_nowait
                         )
@@ -581,17 +917,26 @@ async def _verify_visit(
         raise HTTPException(status_code=409, detail=LOCKED_VISIT)
     if _revision(body.revision) != _revision(doc.updated_at):
         raise HTTPException(status_code=409, detail=STALE_DRAFT)
+    draft = _synthesis(doc)
+    prescriptions = {
+        index
+        for index, order in enumerate(draft.staged_orders)
+        if order.order_type == "prescription"
+    }
+    if body.dropped_prescriptions - prescriptions:
+        raise HTTPException(status_code=422, detail="Invalid dropped prescription selection.")
     try:
         draft, report = await verify_draft(
             _client(request),
             settings,
-            _synthesis(doc),
+            draft,
             visit.transcript,
             PatientContext.from_patient(visit.patient),
             repair=body.repair,
             summary_language=_preferred_language(visit),
             note_language=_note_language(visit),
             progress=progress,
+            dropped_prescriptions=frozenset(body.dropped_prescriptions),
         )
     except VerificationUnavailableError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -681,11 +1026,9 @@ async def change_visit_language(
         raise HTTPException(
             status_code=502, detail="Could not translate and verify the draft."
         ) from exc
-    visit.patient.demographics = {
-        **visit.patient.demographics,
-        "note_language": body.note_language,
-        "patient_language": body.patient_language,
-    }
+    _save_visit_language(
+        visit, note_language=body.note_language, patient_language=body.patient_language
+    )
     return await _save_verified_revision(session, visit, doc, translated, report)
 
 
@@ -754,6 +1097,8 @@ async def save_review(
     response: Response,
 ) -> VisitView:
     _no_store(response)
+    if settings.hosted_demo and body.text_on_approval_to:
+        raise HTTPException(status_code=403, detail="Text messaging is unavailable in the demo.")
     visit = await _load_visit(session, visit_id)
     doc = next(iter(visit.clinical_documents), None)
     if body.text_on_approval_to and body.clinician is None:
@@ -797,7 +1142,10 @@ async def save_review(
             for index, order in enumerate(doc.staged_orders)
             if order["order_type"] == "prescription" and index not in kept
         }
-        _require_consistent_draft(verification, kept, dropped_prescriptions)
+        direction_dismissals = {
+            item.finding_id for item in body.resolutions if item.action == "not_a_direction"
+        }
+        _require_consistent_draft(verification, kept, dropped_prescriptions, direction_dismissals)
         verification.resolutions = _audit_resolutions(
             verification, body.resolutions, kept, body.clinician, approved_at
         )
@@ -834,7 +1182,10 @@ async def save_review(
 
 
 def _require_consistent_draft(
-    report: VerificationReport, kept: set[int], dropped_prescriptions: set[int]
+    report: VerificationReport,
+    kept: set[int],
+    dropped_prescriptions: set[int],
+    direction_dismissals: set[str],
 ) -> None:
     if dropped_prescriptions and report.prescription_directions is None:
         raise HTTPException(
@@ -844,7 +1195,7 @@ def _require_consistent_draft(
     locations = {
         item.area
         for item in report.prescription_directions or []
-        if item.order_index in dropped_prescriptions
+        if item.order_index in dropped_prescriptions and item.id not in direction_dismissals
     }
     if locations:
         labels = {"plan": "Plan", "patient_instructions": "patient instructions"}
@@ -853,6 +1204,10 @@ def _require_consistent_draft(
             status_code=409,
             detail=f"Edit and verify the {sections} before approving a dropped prescription.",
         )
+    if any(
+        item.kind == "chart_withholding" and item.order_index in kept for item in report.findings
+    ):
+        raise HTTPException(status_code=409, detail="Drop the prescription documented as withheld.")
     if any(
         item.kind == "language" and (item.order_index is None or item.order_index in kept)
         for item in report.findings
@@ -871,12 +1226,26 @@ def _audit_resolutions(
     approved_at: datetime,
 ) -> list[ResolutionAudit]:
     required = {item.id: item for item in report.findings if item.severity != "info"}
+    directions = {
+        item.id for item in report.prescription_directions or [] if item.order_index not in kept
+    }
     decisions = {item.finding_id: item for item in resolutions}
-    if len(decisions) != len(resolutions) or decisions.keys() - required.keys():
+    if len(decisions) != len(resolutions) or decisions.keys() - (required.keys() | directions):
         raise HTTPException(
             status_code=409, detail="Resolve findings from the current verification."
         )
     audit = []
+    for direction_id in directions & decisions.keys():
+        direction_resolution = decisions[direction_id]
+        if direction_resolution.action != "not_a_direction":
+            raise HTTPException(
+                status_code=409, detail="Dismiss the marked wording as a direction."
+            )
+        audit.append(
+            ResolutionAudit(
+                **direction_resolution.model_dump(), reviewer=clinician, resolved_at=approved_at
+            )
+        )
     for finding_id, finding in required.items():
         resolution = decisions.get(finding_id)
         if finding.kind == "unsupported_order" and finding.order_index in kept:
@@ -902,7 +1271,15 @@ def _audit_resolutions(
                     status_code=409,
                     detail="Resolve each blocking finding. Overrides need at least 8 characters.",
                 )
-        elif resolution is None or resolution.action not in {"answered", "dismissed"}:
+        elif resolution is None or (
+            resolution.action not in {"answered", "dismissed"}
+            and not (
+                resolution.action == "dropped"
+                and finding.area == "order"
+                and finding.order_index is not None
+                and finding.order_index not in kept
+            )
+        ):
             raise HTTPException(status_code=409, detail="Answer or dismiss every open question.")
         assert resolution is not None
         audit.append(
@@ -939,6 +1316,8 @@ async def text_summary(
     response: Response,
 ) -> SummaryTextReceipt:
     _no_store(response)
+    if settings.hosted_demo:
+        raise HTTPException(status_code=403, detail="Text messaging is unavailable in the demo.")
     visit = await _load_visit(session, visit_id)
     if visit.status != EncounterStatus.COMPLETED:
         raise HTTPException(status_code=409, detail="Approve the visit before texting its summary.")
